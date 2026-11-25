@@ -8,6 +8,23 @@
 An ultra-lightweight, portable, native Windows live ping monitor written in **Rust & Win32 API**.  
 Engineered for minimal resource footprint (**~1.8 MB RAM**, **< 1 MB standalone `.exe`**) with zero external runtime dependencies.
 
+## Screenshots
+
+<table align="center">
+  <tr>
+    <td align="center" valign="middle">
+      <img src="assets/main.png" alt="NanoPing Main Window" width="380" />
+      <br />
+      <sub><b>Live Monitor HUD</b></sub>
+    </td>
+    <td align="center" valign="middle">
+      <img src="assets/settings.png" alt="NanoPing Settings" width="250" />
+      <br />
+      <sub><b>Settings Dialog</b></sub>
+    </td>
+  </tr>
+</table>
+
 ## Features
 
 - **Ultra-Low Resource Usage:** Pure native Rust + Double-Buffered Win32 GDI (~1.8 MB RAM, near-zero idle CPU).
