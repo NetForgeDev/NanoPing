@@ -47,6 +47,13 @@ Engineered for minimal resource footprint (**~1.8 MB RAM**, **< 1 MB standalone 
 
 Grab the latest standalone `NanoPing.exe` or portable `.zip` archive from the [Releases](https://github.com/NetForgeDev/NanoPing/releases/latest) page.
 
+> **Windows SmartScreen Notice:** Because `NanoPing.exe` is an unsigned open-source binary, Windows Defender SmartScreen may display *"Windows protected your PC"* on the first launch after downloading from a browser. Click **More info** → **Run anyway** to run it. All release binaries and `SHA256SUMS.txt` checksums are built transparently from source via [GitHub Actions](.github/workflows/release.yml).
+
+To verify your downloaded binary in PowerShell:
+```powershell
+Get-FileHash NanoPing.exe -Algorithm SHA256
+```
+
 ## Configuration (`config.ini`)
 
 `config.ini` is automatically created beside `NanoPing.exe` on first launch:
