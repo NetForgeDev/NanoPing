@@ -1,0 +1,1013 @@
+use std::ptr;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Instant;
+
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
+    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HFONT, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, IsIconic, KillTimer,
+    LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, MSG, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
+    WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW,
+    WS_CAPTION, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+};
+
+use crate::config::{set_autostart, Config};
+use crate::ping::{PingEngine, PingEvent};
+use crate::state::AppStats;
+use crate::ui::settings_win::show_settings_dialog;
+use crate::ui::win_util::{
+    apply_exe_icon, enable_dark_title_bar, get_dpi_scale, method_color,
+    resolve_safe_window_position, rgb, scale_px, to_wide, APP_NAME, BG_BOX, BG_BTN, BG_BTN_HOVER,
+    BG_MAIN,
+};
+
+pub const WM_APP_PING_READY: u32 = WM_APP + 1;
+pub const WM_APP_PREVIEW_CONFIG: u32 = WM_APP + 3;
+const WM_DISPLAYCHANGE: u32 = 0x007E;
+const ANIM_TIMER_ID: usize = 1;
+
+const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TopBtn {
+    Set,
+    Pin,
+    Method,
+    Reset,
+}
+
+struct ButtonRect {
+    kind: TopBtn,
+    rect: RECT,
+}
+
+struct Layout {
+    client_w: i32,
+    client_h: i32,
+    pad_x: i32,
+    top_h: i32,
+    row_h: i32,
+    ip_w: i32,
+    loss_w: i32,
+    avg_w: i32,
+    hist_cell_w: i32,
+    sep_w: i32,
+    gap: i32,
+    buttons: Vec<ButtonRect>,
+}
+
+struct MainState {
+    hwnd: HWND,
+    config: Config,
+    stats: AppStats,
+    engine: PingEngine,
+    tx: Sender<PingEvent>,
+    rx: Receiver<PingEvent>,
+    scale: f32,
+    font_ui: HFONT,
+    font_mono: HFONT,
+    font_hist: HFONT,
+    font_sep: HFONT,
+    layout: Layout,
+    hovered_btn: Option<TopBtn>,
+    tracking_mouse: bool,
+    anim_timer_active: bool,
+}
+
+impl MainState {
+    unsafe fn create_fonts(scale: f32, font_size: u32) -> (HFONT, HFONT, HFONT, HFONT) {
+        let segoe = to_wide("Segoe UI");
+        let consolas = to_wide("Consolas");
+        let base = font_size.clamp(9, 28) as f32;
+
+        let h_mono = base.round() as i32;
+        let h_hist = (base * 0.86).round().max(8.0) as i32;
+        let h_ui = (base * 0.79).round().max(8.0) as i32;
+        let h_sep = (base * 0.72).round().max(7.0) as i32;
+
+        let mk = |h: i32, weight: i32, face: &[u16]| -> HFONT {
+            CreateFontW(
+                -scale_px(h, scale),
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                OUT_DEFAULT_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                CLEARTYPE_QUALITY as u32,
+                DEFAULT_PITCH as u32,
+                face.as_ptr(),
+            )
+        };
+
+        (
+            mk(h_ui, 700, &segoe),
+            mk(h_mono, 700, &consolas),
+            mk(h_hist, 700, &consolas),
+            mk(h_sep, 400, &consolas),
+        )
+    }
+
+    unsafe fn recreate_fonts(&mut self) {
+        DeleteObject(self.font_ui as _);
+        DeleteObject(self.font_mono as _);
+        DeleteObject(self.font_hist as _);
+        DeleteObject(self.font_sep as _);
+        let (f_ui, f_mono, f_hist, f_sep) = Self::create_fonts(self.scale, self.config.font_size);
+        self.font_ui = f_ui;
+        self.font_mono = f_mono;
+        self.font_hist = f_hist;
+        self.font_sep = f_sep;
+    }
+
+    unsafe fn measure_char_width(hwnd: HWND, font: HFONT, sample: &str) -> i32 {
+        let hdc = GetDC(hwnd);
+        let old = SelectObject(hdc, font as _);
+        let wide = to_wide(sample);
+        let mut sz = SIZE { cx: 0, cy: 0 };
+        GetTextExtentPoint32W(hdc, wide.as_ptr(), (wide.len() - 1) as i32, &mut sz);
+        SelectObject(hdc, old);
+        ReleaseDC(hwnd, hdc);
+        sz.cx
+    }
+
+    unsafe fn compute_layout(
+        hwnd: HWND,
+        cfg: &Config,
+        scale: f32,
+        font_mono: HFONT,
+        font_hist: HFONT,
+        font_ui: HFONT,
+    ) -> Layout {
+        let ratio = (cfg.font_size.clamp(9, 28) as f32) / 14.0;
+        let s = scale * ratio;
+
+        let pad_x = scale_px(6, s);
+        let pad_bottom = scale_px(4, s);
+        let top_h = scale_px(24, s);
+        let row_h = scale_px(21, s);
+        let gap = scale_px(4, s);
+
+
+        let max_ip_chars = cfg
+            .targets
+            .iter()
+            .map(|t| t.len())
+            .max()
+            .unwrap_or(8)
+            .max(8);
+        let sample_ip = "8".repeat(max_ip_chars);
+        let ip_w = Self::measure_char_width(hwnd, font_mono, &sample_ip) + scale_px(2, scale);
+        let loss_w = Self::measure_char_width(hwnd, font_mono, "L:99%") + scale_px(6, scale);
+        let avg_w = Self::measure_char_width(hwnd, font_mono, "A:999ms") + scale_px(6, scale);
+        let hist_cell_w = Self::measure_char_width(hwnd, font_hist, "999ms") + scale_px(2, scale);
+        let sep_w = scale_px(5, scale);
+
+        let hist_total_w = if cfg.history_count == 0 {
+            0
+        } else {
+            (cfg.history_count as i32) * hist_cell_w
+                + ((cfg.history_count - 1) as i32) * sep_w
+        };
+
+        let table_w = ip_w + gap + loss_w + gap + avg_w + gap + hist_total_w;
+
+        let title_w = Self::measure_char_width(hwnd, font_ui, "NANOPING (ICMP)");
+        let btn_pad_x = scale_px(5, scale);
+        let btn_gap = scale_px(3, scale);
+        let btn_labels = [
+            (TopBtn::Set, "SET"),
+            (TopBtn::Pin, "PIN"),
+            (TopBtn::Method, "ICMP"),
+            (TopBtn::Reset, "RST"),
+        ];
+        let mut btn_widths = Vec::with_capacity(4);
+        let mut total_btns_w = 0;
+        for (kind, text) in btn_labels {
+            let w = Self::measure_char_width(hwnd, font_ui, text) + btn_pad_x * 2;
+            btn_widths.push((kind, w));
+            total_btns_w += w;
+        }
+        total_btns_w += btn_gap * 3;
+
+        let min_header_w = title_w + scale_px(10, scale) + total_btns_w;
+        let content_w = table_w.max(min_header_w);
+
+        let client_w = pad_x * 2 + content_w;
+        let client_h = top_h + (cfg.targets.len() as i32) * row_h + pad_bottom;
+
+        let btn_top = scale_px(3, scale);
+        let btn_bot = top_h - scale_px(3, scale);
+        let mut right_cursor = client_w - pad_x;
+        let mut buttons = Vec::with_capacity(4);
+        for (kind, w) in btn_widths.into_iter().rev() {
+            let rect = RECT {
+                left: right_cursor - w,
+                top: btn_top,
+                right: right_cursor,
+                bottom: btn_bot,
+            };
+            buttons.push(ButtonRect { kind, rect });
+            right_cursor -= w + btn_gap;
+        }
+        buttons.reverse();
+
+        Layout {
+            client_w,
+            client_h,
+            pad_x,
+            top_h,
+            row_h,
+            ip_w,
+            loss_w,
+            avg_w,
+            hist_cell_w,
+            sep_w,
+            gap,
+            buttons,
+        }
+    }
+
+    unsafe fn calc_window_size(&self) -> (i32, i32) {
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: self.layout.client_w,
+            bottom: self.layout.client_h,
+        };
+        let ex_style = if self.config.always_on_top {
+            WS_EX_TOPMOST
+        } else {
+            0
+        };
+        AdjustWindowRectEx(&mut r, WINDOW_STYLE, 0, ex_style);
+        (r.right - r.left, r.bottom - r.top)
+    }
+
+    unsafe fn apply_size_and_position(&mut self, use_saved_pos: bool) {
+        let (w, h) = self.calc_window_size();
+        if use_saved_pos {
+            let (sx, sy) = if self.config.save_position {
+                (self.config.window_x, self.config.window_y)
+            } else {
+                (None, None)
+            };
+            let (x, y, adjusted) = resolve_safe_window_position(sx, sy, w, h);
+            if adjusted && self.config.save_position && sx.is_some() && sy.is_some() {
+                self.config.window_x = Some(x);
+                self.config.window_y = Some(y);
+                self.config.save();
+            }
+            let z = if self.config.always_on_top {
+                HWND_TOPMOST
+            } else {
+                HWND_NOTOPMOST
+            };
+            SetWindowPos(self.hwnd, z, x, y, w, h, SWP_NOACTIVATE);
+        } else {
+            SetWindowPos(
+                self.hwnd,
+                ptr::null_mut(),
+                0,
+                0,
+                w,
+                h,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    unsafe fn ensure_on_connected_monitor(&mut self) {
+        if IsIconic(self.hwnd) != 0 {
+            return;
+        }
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(self.hwnd, &mut rect) == 0 {
+            return;
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        let (x, y, adjusted) = resolve_safe_window_position(Some(rect.left), Some(rect.top), w, h);
+        if adjusted {
+            SetWindowPos(
+                self.hwnd,
+                ptr::null_mut(),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            if self.config.save_position {
+                self.config.window_x = Some(x);
+                self.config.window_y = Some(y);
+                self.config.save();
+            }
+        }
+    }
+
+    unsafe fn save_current_position_immediately(&mut self) {
+        if !self.config.save_position || IsIconic(self.hwnd) != 0 {
+            return;
+        }
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(self.hwnd, &mut rect) != 0 {
+            self.config.window_x = Some(rect.left);
+            self.config.window_y = Some(rect.top);
+            self.config.save();
+        }
+    }
+
+    unsafe fn start_or_restart_pingers(&mut self) {
+        self.engine.bump_reset_cycle();
+        self.engine.set_method(self.config.ping_method);
+        self.stats = AppStats::from_config(&self.config);
+
+        self.layout = Self::compute_layout(
+            self.hwnd,
+            &self.config,
+            self.scale,
+            self.font_mono,
+            self.font_hist,
+            self.font_ui,
+        );
+        self.apply_size_and_position(false);
+        self.update_title(APP_NAME);
+        InvalidateRect(self.hwnd, ptr::null(), 0);
+
+        self.engine.start_workers(
+            self.hwnd,
+            &self.config.targets,
+            self.config.refresh_interval_ms,
+            self.config.timeout_ms,
+            self.tx.clone(),
+        );
+    }
+
+    unsafe fn apply_config_change(&mut self, mut new_cfg: Config, persist: bool) {
+        if new_cfg.save_position && IsIconic(self.hwnd) == 0 {
+            let mut rect: RECT = std::mem::zeroed();
+            if GetWindowRect(self.hwnd, &mut rect) != 0 {
+                new_cfg.window_x = Some(rect.left);
+                new_cfg.window_y = Some(rect.top);
+            }
+        }
+        let font_changed = new_cfg.font_size != self.config.font_size;
+        let needs_rebuild = new_cfg.targets != self.config.targets
+            || new_cfg.history_count != self.config.history_count
+            || new_cfg.ping_method != self.config.ping_method
+            || new_cfg.refresh_interval_ms != self.config.refresh_interval_ms
+            || new_cfg.timeout_ms != self.config.timeout_ms;
+
+        let window_sizes_changed = new_cfg.loss_window_size != self.config.loss_window_size
+            || new_cfg.avg_window_size != self.config.avg_window_size;
+
+        let topmost_changed = new_cfg.always_on_top != self.config.always_on_top;
+
+        if persist {
+            new_cfg.save();
+            set_autostart(new_cfg.autostart);
+        }
+        self.config = new_cfg;
+if font_changed {
+            self.recreate_fonts();
+        }
+        if topmost_changed {
+            let z = if self.config.always_on_top {
+                HWND_TOPMOST
+            } else {
+                HWND_NOTOPMOST
+            };
+            SetWindowPos(
+                self.hwnd,
+                z,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+
+        if needs_rebuild {
+            self.start_or_restart_pingers();
+        } else if window_sizes_changed {
+            if font_changed {
+                self.layout = Self::compute_layout(
+                    self.hwnd,
+                    &self.config,
+                    self.scale,
+                    self.font_mono,
+                    self.font_hist,
+                    self.font_ui,
+                );
+                self.apply_size_and_position(false);
+            }
+            self.stats = AppStats::from_config(&self.config);
+            self.reset_stats();
+        } else {
+            if font_changed {
+                self.layout = Self::compute_layout(
+                    self.hwnd,
+                    &self.config,
+                    self.scale,
+                    self.font_mono,
+                    self.font_hist,
+                    self.font_ui,
+                );
+                self.apply_size_and_position(false);
+            }
+            InvalidateRect(self.hwnd, ptr::null(), 0);
+        }
+    }
+
+    unsafe fn reset_stats(&mut self) {
+        self.engine.bump_reset_cycle();
+        self.stats.reset();
+        self.update_title(APP_NAME);
+        InvalidateRect(self.hwnd, ptr::null(), 0);
+    }
+
+    unsafe fn update_title(&self, title: &str) {
+        let wide = to_wide(title);
+        SetWindowTextW(self.hwnd, wide.as_ptr());
+    }
+
+    unsafe fn ensure_anim_timer(&mut self) {
+        if !self.anim_timer_active {
+            SetTimer(self.hwnd, ANIM_TIMER_ID, 16, None);
+            self.anim_timer_active = true;
+        }
+    }
+
+    unsafe fn stop_anim_timer(&mut self) {
+        if self.anim_timer_active {
+            KillTimer(self.hwnd, ANIM_TIMER_ID);
+            self.anim_timer_active = false;
+        }
+    }
+
+    fn hit_test_button(&self, x: i32, y: i32) -> Option<TopBtn> {
+        for b in &self.layout.buttons {
+            if x >= b.rect.left && x <= b.rect.right && y >= b.rect.top && y <= b.rect.bottom {
+                return Some(b.kind);
+            }
+        }
+        None
+    }
+
+    unsafe fn handle_quick_button(&mut self, kind: TopBtn) {
+        match kind {
+            TopBtn::Pin => {
+                self.config.always_on_top = !self.config.always_on_top;
+                let z = if self.config.always_on_top {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                };
+                SetWindowPos(self.hwnd, z, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                self.config.save();
+                InvalidateRect(self.hwnd, ptr::null(), 0);
+            }
+            TopBtn::Method => {
+                self.config.ping_method = self.config.ping_method.next();
+                self.engine.set_method(self.config.ping_method);
+                self.config.save();
+                self.reset_stats();
+            }
+            TopBtn::Reset => {
+                self.reset_stats();
+            }
+            TopBtn::Set => {}
+        }
+    }
+
+    unsafe fn paint(&mut self) {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(self.hwnd, &mut ps);
+
+        let mut cr: RECT = std::mem::zeroed();
+        GetClientRect(self.hwnd, &mut cr);
+        let w = (cr.right - cr.left).max(1);
+        let h = (cr.bottom - cr.top).max(1);
+
+        let mem_dc = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old_bmp = SelectObject(mem_dc, bmp as _);
+
+        let bg_brush = CreateSolidBrush(BG_MAIN);
+        FillRect(mem_dc, &cr, bg_brush);
+        DeleteObject(bg_brush as _);
+
+        SetBkMode(mem_dc, TRANSPARENT as i32);
+
+        let l = &self.layout;
+        let now = Instant::now();
+
+        // 1. Header title
+        SelectObject(mem_dc, self.font_ui as _);
+        SetTextColor(mem_dc, rgb(0x55, 0x55, 0x55));
+        let header_text = to_wide(&format!("NANOPING ({})", self.config.ping_method.as_upper()));
+        let mut header_rect = RECT {
+            left: l.pad_x,
+            top: 0,
+            right: l.client_w - l.pad_x,
+            bottom: l.top_h,
+        };
+        DrawTextW(
+            mem_dc,
+            header_text.as_ptr(),
+            -1,
+            &mut header_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        // 2. Header buttons
+        let corner = scale_px(4, self.scale);
+        let pen_btn_border = CreatePen(PS_SOLID as i32, 1, rgb(0x22, 0x22, 0x22));
+        for btn in &l.buttons {
+            let hovered = self.hovered_btn == Some(btn.kind);
+            let fill = CreateSolidBrush(if hovered { BG_BTN_HOVER } else { BG_BTN });
+            let old_b = SelectObject(mem_dc, fill as _);
+            let old_p = SelectObject(mem_dc, pen_btn_border as _);
+            RoundRect(
+                mem_dc,
+                btn.rect.left,
+                btn.rect.top,
+                btn.rect.right,
+                btn.rect.bottom,
+                corner,
+                corner,
+            );
+            SelectObject(mem_dc, old_b);
+            SelectObject(mem_dc, old_p);
+            DeleteObject(fill as _);
+
+            let (label, fg) = match btn.kind {
+                TopBtn::Set => (
+                    "SET",
+                    if hovered {
+                        rgb(0xff, 0xff, 0xff)
+                    } else {
+                        rgb(0xaa, 0xaa, 0xaa)
+                    },
+                ),
+                TopBtn::Pin => (
+                    "PIN",
+                    if self.config.always_on_top {
+                        rgb(0x00, 0xff, 0x66)
+                    } else if hovered {
+                        rgb(0xaa, 0xaa, 0xaa)
+                    } else {
+                        rgb(0x66, 0x66, 0x66)
+                    },
+                ),
+                TopBtn::Method => (
+                    self.config.ping_method.as_upper(),
+                    method_color(self.config.ping_method),
+                ),
+                TopBtn::Reset => (
+                    "RST",
+                    if hovered {
+                        rgb(0xff, 0xff, 0xff)
+                    } else {
+                        rgb(0xff, 0xcc, 0x00)
+                    },
+                ),
+            };
+            SetTextColor(mem_dc, fg);
+            let wide = to_wide(label);
+            let mut r = btn.rect;
+            DrawTextW(
+                mem_dc,
+                wide.as_ptr(),
+                -1,
+                &mut r,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+        DeleteObject(pen_btn_border as _);
+
+        // 3. Target rows
+        let box_brush = CreateSolidBrush(BG_BOX);
+        let box_pen = CreatePen(PS_SOLID as i32, 1, rgb(0x1b, 0x1b, 0x1b));
+        let box_pad_y = scale_px(2, self.scale);
+
+        for (row_idx, row) in self.stats.rows.iter().enumerate() {
+            let y_top = l.top_h + (row_idx as i32) * l.row_h;
+            let y_bot = y_top + l.row_h;
+            let mut x = l.pad_x;
+
+            SelectObject(mem_dc, self.font_mono as _);
+            SetTextColor(mem_dc, rgb(0xff, 0xff, 0xff));
+            let mut r_ip = RECT {
+                left: x,
+                top: y_top,
+                right: x + l.ip_w,
+                bottom: y_bot,
+            };
+            let w_ip = to_wide(&row.target);
+            DrawTextW(
+                mem_dc,
+                w_ip.as_ptr(),
+                -1,
+                &mut r_ip,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            x += l.ip_w + l.gap;
+
+            // Loss box
+            let mut r_loss = RECT {
+                left: x,
+                top: y_top + box_pad_y,
+                right: x + l.loss_w,
+                bottom: y_bot - box_pad_y,
+            };
+            let old_b = SelectObject(mem_dc, box_brush as _);
+            let old_p = SelectObject(mem_dc, box_pen as _);
+            RoundRect(
+                mem_dc,
+                r_loss.left,
+                r_loss.top,
+                r_loss.right,
+                r_loss.bottom,
+                corner,
+                corner,
+            );
+            SelectObject(mem_dc, old_b);
+            SelectObject(mem_dc, old_p);
+
+            SetTextColor(mem_dc, row.loss_color(&self.config.colors));
+            let w_loss = to_wide(&format!("L:{:.0}%", row.loss_pct()));
+            DrawTextW(
+                mem_dc,
+                w_loss.as_ptr(),
+                -1,
+                &mut r_loss,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            x += l.loss_w + l.gap;
+
+            // Average box
+            let mut r_avg = RECT {
+                left: x,
+                top: y_top + box_pad_y,
+                right: x + l.avg_w,
+                bottom: y_bot - box_pad_y,
+            };
+            let old_b = SelectObject(mem_dc, box_brush as _);
+            let old_p = SelectObject(mem_dc, box_pen as _);
+            RoundRect(
+                mem_dc,
+                r_avg.left,
+                r_avg.top,
+                r_avg.right,
+                r_avg.bottom,
+                corner,
+                corner,
+            );
+            SelectObject(mem_dc, old_b);
+            SelectObject(mem_dc, old_p);
+
+             SetTextColor(mem_dc, row.avg_color(&self.config.colors));
+            let w_avg = to_wide(&format!("A:{}ms", row.avg_ms()));
+            DrawTextW(
+                mem_dc,
+                w_avg.as_ptr(),
+                -1,
+                &mut r_avg,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            x += l.avg_w + l.gap;
+
+            // History cells
+            for i in 0..row.history.len() {
+                if i > 0 {
+                    SelectObject(mem_dc, self.font_sep as _);
+                    SetTextColor(mem_dc, rgb(0x28, 0x28, 0x28));
+                    let mut r_sep = RECT {
+                        left: x,
+                        top: y_top,
+                        right: x + l.sep_w,
+                        bottom: y_bot,
+                    };
+                    let sep = to_wide("|");
+                    DrawTextW(
+                        mem_dc,
+                        sep.as_ptr(),
+                        -1,
+                        &mut r_sep,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                    );
+                    x += l.sep_w;
+                }
+
+                SelectObject(mem_dc, self.font_hist as _);
+                let (col, _) = row.cell_render_color(i, self.config.wave_speed, &self.config.colors, now);
+                SetTextColor(mem_dc, col);
+                let mut r_cell = RECT {
+                    left: x,
+                    top: y_top,
+                    right: x + l.hist_cell_w,
+                    bottom: y_bot,
+                };
+                let w_val = to_wide(&row.history[i].text);
+                DrawTextW(
+                    mem_dc,
+                    w_val.as_ptr(),
+                    -1,
+                    &mut r_cell,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+                x += l.hist_cell_w;
+            }
+        }
+
+        DeleteObject(box_brush as _);
+        DeleteObject(box_pen as _);
+
+        BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+        SelectObject(mem_dc, old_bmp);
+        DeleteObject(bmp as _);
+        DeleteDC(mem_dc);
+
+        EndPaint(self.hwnd, &ps);
+    }
+}
+
+impl Drop for MainState {
+    fn drop(&mut self) {
+        self.engine.stop();
+        unsafe {
+            DeleteObject(self.font_ui as _);
+            DeleteObject(self.font_mono as _);
+            DeleteObject(self.font_hist as _);
+            DeleteObject(self.font_sep as _);
+        }
+    }
+}
+
+unsafe extern "system" fn main_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MainState;
+    if state_ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            (*state_ptr).paint();
+            0
+        }
+        WM_APP_PING_READY => {
+            let state = &mut *state_ptr;
+            let active_cycle = state.engine.current_cycle();
+            let mut any_updated = false;
+            while let Ok(ev) = state.rx.try_recv() {
+                if ev.cycle != active_cycle {
+                    continue;
+                }
+                if let Some(row) = state.stats.rows.get_mut(ev.target_idx) {
+                    row.push(ev.result, state.config.wave_effect);
+                    any_updated = true;
+                }
+            }
+            if any_updated {
+                let title = state.stats.build_window_title();
+                state.update_title(&title);
+                if state.config.wave_effect {
+                    state.ensure_anim_timer();
+                }
+                InvalidateRect(hwnd, ptr::null(), 0);
+            }
+            0
+        }
+        WM_APP_PREVIEW_CONFIG => {
+            let cfg_ptr = lparam as *const Config;
+            if !cfg_ptr.is_null() {
+                let preview = (*cfg_ptr).clone();
+                (*state_ptr).apply_config_change(preview, false);
+            }
+            0
+        }
+        WM_TIMER => {
+            if wparam == ANIM_TIMER_ID {
+                let state = &mut *state_ptr;
+                let active = state
+                    .stats
+                    .has_active_animations(state.config.wave_speed, Instant::now());
+                InvalidateRect(hwnd, ptr::null(), 0);
+                if !active {
+                    state.stop_anim_timer();
+                }
+            }
+            0
+        }
+        WM_MOUSEMOVE => {
+            let state = &mut *state_ptr;
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            if !state.tracking_mouse {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                TrackMouseEvent(&mut tme);
+                state.tracking_mouse = true;
+            }
+            let hovered = state.hit_test_button(x, y);
+            if hovered != state.hovered_btn {
+                state.hovered_btn = hovered;
+                InvalidateRect(hwnd, ptr::null(), 0);
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            let state = &mut *state_ptr;
+            state.tracking_mouse = false;
+            if state.hovered_btn.is_some() {
+                state.hovered_btn = None;
+                InvalidateRect(hwnd, ptr::null(), 0);
+            }
+            0
+        }
+        WM_SETCURSOR => {
+            if (lparam & 0xFFFF) == 1 && (*state_ptr).hovered_btn.is_some() {
+                SetCursor(LoadCursorW(ptr::null_mut(), IDC_HAND));
+                return 1;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONUP => {
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            let clicked = (*state_ptr).hit_test_button(x, y);
+            if let Some(btn) = clicked {
+                if btn == TopBtn::Set {
+                    // Snapshot config and release mutable borrow while Settings dialog runs
+                    let original_cfg = (*state_ptr).config.clone();
+                    let saved = show_settings_dialog(hwnd, &original_cfg);
+                    let state = &mut *state_ptr;
+                    match saved {
+                        Some(new_cfg) => state.apply_config_change(new_cfg, true),
+                        None => state.apply_config_change(original_cfg, false),
+                    }
+                } else {
+                    (*state_ptr).handle_quick_button(btn);
+                }
+            }
+            0
+        }
+        WM_EXITSIZEMOVE => {
+            (*state_ptr).save_current_position_immediately();
+            0
+        }
+        WM_DISPLAYCHANGE => {
+            (*state_ptr).ensure_on_connected_monitor();
+            0
+        }
+        WM_CLOSE => {
+            let state = &mut *state_ptr;
+            state.save_current_position_immediately();
+            state.stop_anim_timer();
+            state.engine.stop();
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let _ = Box::from_raw(state_ptr);
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+pub fn run() {
+    let config = Config::load();
+    let stats = AppStats::from_config(&config);
+    let engine = PingEngine::new(config.ping_method);
+    let (tx, rx) = mpsc::channel();
+
+    unsafe {
+        let hinst = GetModuleHandleW(ptr::null());
+        let class_name = to_wide("NanoPingMainWindow");
+
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(main_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: ptr::null_mut(),
+            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+            hbrBackground: ptr::null_mut(),
+            lpszMenuName: ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+            hIconSm: ptr::null_mut(),
+        };
+        RegisterClassExW(&wc);
+
+        let ex_style = if config.always_on_top {
+            WS_EX_TOPMOST
+        } else {
+            0
+        };
+        let title = to_wide(APP_NAME);
+        let hwnd = CreateWindowExW(
+            ex_style,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WINDOW_STYLE,
+            0,
+            0,
+            300,
+            120,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            hinst,
+            ptr::null(),
+        );
+        if hwnd.is_null() {
+            return;
+        }
+
+        enable_dark_title_bar(hwnd);
+        apply_exe_icon(hwnd);
+
+        let scale = get_dpi_scale(hwnd);
+        let (font_ui, font_mono, font_hist, font_sep) = MainState::create_fonts(scale, config.font_size);
+        let layout =
+            MainState::compute_layout(hwnd, &config, scale, font_mono, font_hist, font_ui);
+
+        let mut state = Box::new(MainState {
+            hwnd,
+            config,
+            stats,
+            engine,
+            tx,
+            rx,
+            scale,
+            font_ui,
+            font_mono,
+            font_hist,
+            font_sep,
+            layout,
+            hovered_btn: None,
+            tracking_mouse: false,
+            anim_timer_active: false,
+        });
+
+        state.apply_size_and_position(true);
+
+        let state_ptr = Box::into_raw(state);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+
+        let s = &mut *state_ptr;
+        s.engine.start_workers(
+            hwnd,
+            &s.config.targets,
+            s.config.refresh_interval_ms,
+            s.config.timeout_ms,
+            s.tx.clone(),
+        );
+
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
