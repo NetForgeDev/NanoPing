@@ -31,7 +31,6 @@ pub const APP_NAME: &str = "NanoPing";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GITHUB_REPO: &str = "NetForgeDev/NanoPing";
 pub const GITHUB_URL: &str = "https://github.com/NetForgeDev/NanoPing";
-pub const GITHUB_RELEASES_URL: &str = "https://github.com/NetForgeDev/NanoPing/releases/latest";
 
 /// Builds a Win32 GDI `COLORREF` (`0x00BBGGRR`).
 pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {

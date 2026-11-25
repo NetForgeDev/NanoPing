@@ -1,6 +1,7 @@
 use std::ptr;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -19,33 +20,42 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, IsIconic, KillTimer,
-    LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, MSG, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW,
-    WS_CAPTION, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW,
+    CS_VREDRAW, GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IDYES,
+    MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,WM_LBUTTONDOWN,
 };
 
 use crate::config::{set_autostart, Config};
 use crate::ping::{PingEngine, PingEvent};
 use crate::state::AppStats;
 use crate::ui::settings_win::show_settings_dialog;
+use crate::ui::tooltip::DarkTooltip;
 use crate::ui::win_util::{
     apply_exe_icon, enable_dark_title_bar, get_dpi_scale, method_color,
-    resolve_safe_window_position, rgb, scale_px, to_wide, APP_NAME, BG_BOX, BG_BTN, BG_BTN_HOVER,
-    BG_MAIN,
+    resolve_safe_window_position, rgb, scale_px, to_wide, APP_NAME, APP_VERSION, BG_BOX, BG_BTN,
+    BG_BTN_HOVER, BG_MAIN,
+};
+use crate::updater::{
+    check_for_updates, download_and_install_update, UpdateInfo, UpdateStatus,
 };
 
 pub const WM_APP_PING_READY: u32 = WM_APP + 1;
 pub const WM_APP_PREVIEW_CONFIG: u32 = WM_APP + 3;
+const WM_APP_UPDATE_EVENT: u32 = WM_APP + 4;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const ANIM_TIMER_ID: usize = 1;
+const TOOLTIP_TIMER_ID: usize = 2;
+const TOOLTIP_DELAY_MS: u32 = 450;
 
 const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TopBtn {
+    Update,
     Set,
     Pin,
     Method,
@@ -55,6 +65,11 @@ enum TopBtn {
 struct ButtonRect {
     kind: TopBtn,
     rect: RECT,
+}
+
+enum MainUpdateEvent {
+    Available(UpdateInfo),
+    InstallDone(Result<(), String>),
 }
 
 struct Layout {
@@ -79,6 +94,10 @@ struct MainState {
     engine: PingEngine,
     tx: Sender<PingEvent>,
     rx: Receiver<PingEvent>,
+    upd_tx: Sender<MainUpdateEvent>,
+    upd_rx: Receiver<MainUpdateEvent>,
+    available_update: Option<UpdateInfo>,
+    updating: bool,
     scale: f32,
     font_ui: HFONT,
     font_mono: HFONT,
@@ -88,6 +107,7 @@ struct MainState {
     hovered_btn: Option<TopBtn>,
     tracking_mouse: bool,
     anim_timer_active: bool,
+    tooltip: DarkTooltip,
 }
 
 impl MainState {
@@ -158,6 +178,7 @@ impl MainState {
         font_mono: HFONT,
         font_hist: HFONT,
         font_ui: HFONT,
+        show_update_btn: bool,
     ) -> Layout {
         let ratio = (cfg.font_size.clamp(9, 28) as f32) / 14.0;
         let s = scale * ratio;
@@ -168,7 +189,6 @@ impl MainState {
         let row_h = scale_px(21, s);
         let gap = scale_px(4, s);
 
-
         let max_ip_chars = cfg
             .targets
             .iter()
@@ -177,11 +197,11 @@ impl MainState {
             .unwrap_or(8)
             .max(8);
         let sample_ip = "8".repeat(max_ip_chars);
-        let ip_w = Self::measure_char_width(hwnd, font_mono, &sample_ip) + scale_px(2, scale);
-        let loss_w = Self::measure_char_width(hwnd, font_mono, "L:99%") + scale_px(6, scale);
-        let avg_w = Self::measure_char_width(hwnd, font_mono, "A:999ms") + scale_px(6, scale);
-        let hist_cell_w = Self::measure_char_width(hwnd, font_hist, "999ms") + scale_px(2, scale);
-        let sep_w = scale_px(5, scale);
+        let ip_w = Self::measure_char_width(hwnd, font_mono, &sample_ip) + scale_px(2, s);
+        let loss_w = Self::measure_char_width(hwnd, font_mono, "L:99%") + scale_px(6, s);
+        let avg_w = Self::measure_char_width(hwnd, font_mono, "A:999ms") + scale_px(6, s);
+        let hist_cell_w = Self::measure_char_width(hwnd, font_hist, "999ms") + scale_px(2, s);
+        let sep_w = scale_px(5, s);
 
         let hist_total_w = if cfg.history_count == 0 {
             0
@@ -193,33 +213,39 @@ impl MainState {
         let table_w = ip_w + gap + loss_w + gap + avg_w + gap + hist_total_w;
 
         let title_w = Self::measure_char_width(hwnd, font_ui, "NANOPING (ICMP)");
-        let btn_pad_x = scale_px(5, scale);
-        let btn_gap = scale_px(3, scale);
-        let btn_labels = [
-            (TopBtn::Set, "SET"),
-            (TopBtn::Pin, "PIN"),
-            (TopBtn::Method, "ICMP"),
-            (TopBtn::Reset, "RST"),
-        ];
-        let mut btn_widths = Vec::with_capacity(4);
+        let btn_pad_x = scale_px(5, s);
+        let btn_gap = scale_px(3, s);
+
+        let mut btn_labels: Vec<(TopBtn, &str)> = Vec::with_capacity(5);
+        if show_update_btn {
+            btn_labels.push((TopBtn::Update, "UPD"));
+        }
+        btn_labels.push((TopBtn::Set, "SET"));
+        btn_labels.push((TopBtn::Pin, "PIN"));
+        btn_labels.push((TopBtn::Method, "ICMP"));
+        btn_labels.push((TopBtn::Reset, "RST"));
+
+        let mut btn_widths = Vec::with_capacity(btn_labels.len());
         let mut total_btns_w = 0;
         for (kind, text) in btn_labels {
             let w = Self::measure_char_width(hwnd, font_ui, text) + btn_pad_x * 2;
             btn_widths.push((kind, w));
             total_btns_w += w;
         }
-        total_btns_w += btn_gap * 3;
+        if btn_widths.len() > 1 {
+            total_btns_w += btn_gap * (btn_widths.len() as i32 - 1);
+        }
 
-        let min_header_w = title_w + scale_px(10, scale) + total_btns_w;
+        let min_header_w = title_w + scale_px(10, s) + total_btns_w;
         let content_w = table_w.max(min_header_w);
 
         let client_w = pad_x * 2 + content_w;
         let client_h = top_h + (cfg.targets.len() as i32) * row_h + pad_bottom;
 
-        let btn_top = scale_px(3, scale);
-        let btn_bot = top_h - scale_px(3, scale);
+        let btn_top = scale_px(3, s);
+        let btn_bot = top_h - scale_px(3, s);
         let mut right_cursor = client_w - pad_x;
-        let mut buttons = Vec::with_capacity(4);
+        let mut buttons = Vec::with_capacity(btn_widths.len());
         for (kind, w) in btn_widths.into_iter().rev() {
             let rect = RECT {
                 left: right_cursor - w,
@@ -246,6 +272,19 @@ impl MainState {
             gap,
             buttons,
         }
+    }
+
+    unsafe fn refresh_layout(&mut self) {
+        self.layout = Self::compute_layout(
+            self.hwnd,
+            &self.config,
+            self.scale,
+            self.font_mono,
+            self.font_hist,
+            self.font_ui,
+            self.available_update.is_some(),
+        );
+        self.apply_size_and_position(false);
     }
 
     unsafe fn calc_window_size(&self) -> (i32, i32) {
@@ -343,15 +382,7 @@ impl MainState {
         self.engine.set_method(self.config.ping_method);
         self.stats = AppStats::from_config(&self.config);
 
-        self.layout = Self::compute_layout(
-            self.hwnd,
-            &self.config,
-            self.scale,
-            self.font_mono,
-            self.font_hist,
-            self.font_ui,
-        );
-        self.apply_size_and_position(false);
+        self.refresh_layout();
         self.update_title(APP_NAME);
         InvalidateRect(self.hwnd, ptr::null(), 0);
 
@@ -372,7 +403,7 @@ impl MainState {
                 new_cfg.window_y = Some(rect.top);
             }
         }
-        let font_changed = new_cfg.font_size != self.config.font_size;
+
         let needs_rebuild = new_cfg.targets != self.config.targets
             || new_cfg.history_count != self.config.history_count
             || new_cfg.ping_method != self.config.ping_method
@@ -383,15 +414,18 @@ impl MainState {
             || new_cfg.avg_window_size != self.config.avg_window_size;
 
         let topmost_changed = new_cfg.always_on_top != self.config.always_on_top;
+        let font_changed = new_cfg.font_size != self.config.font_size;
 
         if persist {
             new_cfg.save();
             set_autostart(new_cfg.autostart);
         }
         self.config = new_cfg;
-if font_changed {
+
+        if font_changed {
             self.recreate_fonts();
         }
+
         if topmost_changed {
             let z = if self.config.always_on_top {
                 HWND_TOPMOST
@@ -413,32 +447,33 @@ if font_changed {
             self.start_or_restart_pingers();
         } else if window_sizes_changed {
             if font_changed {
-                self.layout = Self::compute_layout(
-                    self.hwnd,
-                    &self.config,
-                    self.scale,
-                    self.font_mono,
-                    self.font_hist,
-                    self.font_ui,
-                );
-                self.apply_size_and_position(false);
+                self.refresh_layout();
             }
             self.stats = AppStats::from_config(&self.config);
             self.reset_stats();
         } else {
             if font_changed {
-                self.layout = Self::compute_layout(
-                    self.hwnd,
-                    &self.config,
-                    self.scale,
-                    self.font_mono,
-                    self.font_hist,
-                    self.font_ui,
-                );
-                self.apply_size_and_position(false);
+                self.refresh_layout();
             }
             InvalidateRect(self.hwnd, ptr::null(), 0);
         }
+    }
+
+    unsafe fn start_update_install(&mut self, info: UpdateInfo) {
+        if self.updating {
+            return;
+        }
+        self.updating = true;
+        InvalidateRect(self.hwnd, ptr::null(), 0);
+
+        let tx = self.upd_tx.clone();
+        let hwnd_raw = self.hwnd as isize;
+        thread::spawn(move || {
+            let res = download_and_install_update(&info.download_url);
+            if tx.send(MainUpdateEvent::InstallDone(res)).is_ok() {
+                let _ = PostMessageW(hwnd_raw as HWND, WM_APP_UPDATE_EVENT, 0, 0);
+            }
+        });
     }
 
     unsafe fn reset_stats(&mut self) {
@@ -465,6 +500,42 @@ if font_changed {
             KillTimer(self.hwnd, ANIM_TIMER_ID);
             self.anim_timer_active = false;
         }
+    }
+    fn tooltip_text(&self, kind: TopBtn) -> String {
+        match kind {
+            TopBtn::Update => {
+                if self.updating {
+                    "Downloading & installing update...".to_string()
+                } else if let Some(ref info) = self.available_update {
+                    let tag = if info.tag.starts_with(['v', 'V']) {
+                        info.tag.clone()
+                    } else {
+                        format!("v{}", info.tag)
+                    };
+                    format!("Update Available ({tag})")
+                } else {
+                    "Update Available".to_string()
+                }
+            }
+            TopBtn::Set => "Settings".to_string(),
+            TopBtn::Pin => {
+                if self.config.always_on_top {
+                    "Always on Top: ON".to_string()
+                } else {
+                    "Always on Top: OFF".to_string()
+                }
+            }
+            TopBtn::Method => format!(
+                "Ping Method: {} (Click to switch)",
+                self.config.ping_method.as_upper()
+            ),
+            TopBtn::Reset => "Reset Statistics".to_string(),
+        }
+    }
+
+    unsafe fn cancel_tooltip(&self) {
+        KillTimer(self.hwnd, TOOLTIP_TIMER_ID);
+        self.tooltip.hide();
     }
 
     fn hit_test_button(&self, x: i32, y: i32) -> Option<TopBtn> {
@@ -498,7 +569,7 @@ if font_changed {
             TopBtn::Reset => {
                 self.reset_stats();
             }
-            TopBtn::Set => {}
+            TopBtn::Set | TopBtn::Update => {}
         }
     }
 
@@ -545,11 +616,28 @@ if font_changed {
         // 2. Header buttons
         let corner = scale_px(4, self.scale);
         let pen_btn_border = CreatePen(PS_SOLID as i32, 1, rgb(0x22, 0x22, 0x22));
+        let pen_upd_border = CreatePen(PS_SOLID as i32, 1, rgb(0x00, 0x88, 0xaa));
         for btn in &l.buttons {
             let hovered = self.hovered_btn == Some(btn.kind);
-            let fill = CreateSolidBrush(if hovered { BG_BTN_HOVER } else { BG_BTN });
+            let fill_col = if btn.kind == TopBtn::Update {
+                if hovered {
+                    rgb(0x18, 0x3a, 0x4e)
+                } else {
+                    rgb(0x0e, 0x24, 0x32)
+                }
+            } else if hovered {
+                BG_BTN_HOVER
+            } else {
+                BG_BTN
+            };
+            let fill = CreateSolidBrush(fill_col);
+            let border_pen = if btn.kind == TopBtn::Update {
+                pen_upd_border
+            } else {
+                pen_btn_border
+            };
             let old_b = SelectObject(mem_dc, fill as _);
-            let old_p = SelectObject(mem_dc, pen_btn_border as _);
+            let old_p = SelectObject(mem_dc, border_pen as _);
             RoundRect(
                 mem_dc,
                 btn.rect.left,
@@ -564,6 +652,14 @@ if font_changed {
             DeleteObject(fill as _);
 
             let (label, fg) = match btn.kind {
+                TopBtn::Update => (
+                    if self.updating { "..." } else { "UPD" },
+                    if hovered {
+                        rgb(0xff, 0xff, 0xff)
+                    } else {
+                        rgb(0x00, 0xdd, 0xff)
+                    },
+                ),
                 TopBtn::Set => (
                     "SET",
                     if hovered {
@@ -607,6 +703,7 @@ if font_changed {
             );
         }
         DeleteObject(pen_btn_border as _);
+        DeleteObject(pen_upd_border as _);
 
         // 3. Target rows
         let box_brush = CreateSolidBrush(BG_BOX);
@@ -689,7 +786,7 @@ if font_changed {
             SelectObject(mem_dc, old_b);
             SelectObject(mem_dc, old_p);
 
-             SetTextColor(mem_dc, row.avg_color(&self.config.colors));
+            SetTextColor(mem_dc, row.avg_color(&self.config.colors));
             let w_avg = to_wide(&format!("A:{}ms", row.avg_ms()));
             DrawTextW(
                 mem_dc,
@@ -723,7 +820,8 @@ if font_changed {
                 }
 
                 SelectObject(mem_dc, self.font_hist as _);
-                let (col, _) = row.cell_render_color(i, self.config.wave_speed, &self.config.colors, now);
+                let (col, _) =
+                    row.cell_render_color(i, self.config.wave_speed, &self.config.colors, now);
                 SetTextColor(mem_dc, col);
                 let mut r_cell = RECT {
                     left: x,
@@ -815,9 +913,38 @@ unsafe extern "system" fn main_wnd_proc(
             }
             0
         }
-        WM_TIMER => {
-            if wparam == ANIM_TIMER_ID {
+        WM_APP_UPDATE_EVENT => {
+            let mut install_error: Option<String> = None;
+            {
                 let state = &mut *state_ptr;
+                while let Ok(ev) = state.upd_rx.try_recv() {
+                    match ev {
+                        MainUpdateEvent::Available(info) => {
+                            state.available_update = Some(info);
+                            state.refresh_layout();
+                            InvalidateRect(hwnd, ptr::null(), 0);
+                        }
+                        MainUpdateEvent::InstallDone(Ok(())) => {
+                            std::process::exit(0);
+                        }
+                        MainUpdateEvent::InstallDone(Err(err)) => {
+                            state.updating = false;
+                            InvalidateRect(hwnd, ptr::null(), 0);
+                            install_error = Some(err);
+                        }
+                    }
+                }
+            }
+            if let Some(err) = install_error {
+                let msg = to_wide(&format!("Update failed:\n{err}"));
+                let cap = to_wide(&format!("{APP_NAME} — Update Error"));
+                MessageBoxW(hwnd, msg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONERROR);
+            }
+            0
+        }
+        WM_TIMER => {
+            let state = &mut *state_ptr;
+            if wparam == ANIM_TIMER_ID {
                 let active = state
                     .stats
                     .has_active_animations(state.config.wave_speed, Instant::now());
@@ -825,9 +952,18 @@ unsafe extern "system" fn main_wnd_proc(
                 if !active {
                     state.stop_anim_timer();
                 }
+            } else if wparam == TOOLTIP_TIMER_ID {
+                KillTimer(hwnd, TOOLTIP_TIMER_ID);
+                if let Some(kind) = state.hovered_btn {
+                    if let Some(btn) = state.layout.buttons.iter().find(|b| b.kind == kind) {
+                        let text = state.tooltip_text(kind);
+                        state.tooltip.show(hwnd, btn.rect, &text);
+                    }
+                }
             }
             0
         }
+
         WM_MOUSEMOVE => {
             let state = &mut *state_ptr;
             let x = (lparam & 0xFFFF) as i16 as i32;
@@ -845,6 +981,10 @@ unsafe extern "system" fn main_wnd_proc(
             let hovered = state.hit_test_button(x, y);
             if hovered != state.hovered_btn {
                 state.hovered_btn = hovered;
+                state.cancel_tooltip();
+                if hovered.is_some() {
+                    SetTimer(hwnd, TOOLTIP_TIMER_ID, TOOLTIP_DELAY_MS, None);
+                }
                 InvalidateRect(hwnd, ptr::null(), 0);
             }
             0
@@ -856,7 +996,9 @@ unsafe extern "system" fn main_wnd_proc(
                 state.hovered_btn = None;
                 InvalidateRect(hwnd, ptr::null(), 0);
             }
+            state.cancel_tooltip();
             0
+        
         }
         WM_SETCURSOR => {
             if (lparam & 0xFFFF) == 1 && (*state_ptr).hovered_btn.is_some() {
@@ -865,22 +1007,53 @@ unsafe extern "system" fn main_wnd_proc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_LBUTTONDOWN => {
+            (*state_ptr).cancel_tooltip();
+            0
+        }
         WM_LBUTTONUP => {
             let x = (lparam & 0xFFFF) as i16 as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
             let clicked = (*state_ptr).hit_test_button(x, y);
             if let Some(btn) = clicked {
-                if btn == TopBtn::Set {
-                    // Snapshot config and release mutable borrow while Settings dialog runs
-                    let original_cfg = (*state_ptr).config.clone();
-                    let saved = show_settings_dialog(hwnd, &original_cfg);
-                    let state = &mut *state_ptr;
-                    match saved {
-                        Some(new_cfg) => state.apply_config_change(new_cfg, true),
-                        None => state.apply_config_change(original_cfg, false),
+                match btn {
+                    TopBtn::Set => {
+                        let original_cfg = (*state_ptr).config.clone();
+                        let saved = show_settings_dialog(hwnd, &original_cfg);
+                        let state = &mut *state_ptr;
+                        match saved {
+                            Some(new_cfg) => state.apply_config_change(new_cfg, true),
+                            None => state.apply_config_change(original_cfg, false),
+                        }
                     }
-                } else {
-                    (*state_ptr).handle_quick_button(btn);
+                    TopBtn::Update => {
+                        if !(*state_ptr).updating {
+                            if let Some(info) = (*state_ptr).available_update.clone() {
+                                let display_tag = if info.tag.starts_with(['v', 'V']) {
+                                    info.tag.clone()
+                                } else {
+                                    format!("v{}", info.tag)
+                                };
+                                let prompt = to_wide(&format!(
+                                    "A new version of {APP_NAME} ({display_tag}) is available.\n\
+                                     Current version: v{APP_VERSION}\n\n\
+                                     Do you want to download, replace the current executable, and restart {APP_NAME} now?\n\
+                                     (Your settings in config.ini will be preserved.)"
+                                ));
+                                let caption = to_wide(&format!("Update Available — {APP_NAME}"));
+                                let choice = MessageBoxW(
+                                    hwnd,
+                                    prompt.as_ptr(),
+                                    caption.as_ptr(),
+                                    MB_YESNO | MB_ICONQUESTION,
+                                );
+                                if choice == IDYES {
+                                    (*state_ptr).start_update_install(info);
+                                }
+                            }
+                        }
+                    }
+                    _ => (*state_ptr).handle_quick_button(btn),
                 }
             }
             0
@@ -890,10 +1063,12 @@ unsafe extern "system" fn main_wnd_proc(
             0
         }
         WM_DISPLAYCHANGE => {
+            (*state_ptr).cancel_tooltip();
             (*state_ptr).ensure_on_connected_monitor();
             0
         }
         WM_CLOSE => {
+            (*state_ptr).cancel_tooltip();
             let state = &mut *state_ptr;
             state.save_current_position_immediately();
             state.stop_anim_timer();
@@ -916,6 +1091,7 @@ pub fn run() {
     let stats = AppStats::from_config(&config);
     let engine = PingEngine::new(config.ping_method);
     let (tx, rx) = mpsc::channel();
+    let (upd_tx, upd_rx) = mpsc::channel();
 
     unsafe {
         let hinst = GetModuleHandleW(ptr::null());
@@ -965,17 +1141,31 @@ pub fn run() {
         apply_exe_icon(hwnd);
 
         let scale = get_dpi_scale(hwnd);
-        let (font_ui, font_mono, font_hist, font_sep) = MainState::create_fonts(scale, config.font_size);
-        let layout =
-            MainState::compute_layout(hwnd, &config, scale, font_mono, font_hist, font_ui);
+        let (font_ui, font_mono, font_hist, font_sep) =
+            MainState::create_fonts(scale, config.font_size);
+        let layout = MainState::compute_layout(
+            hwnd,
+            &config,
+            scale,
+            font_mono,
+            font_hist,
+            font_ui,
+            false,
+        );
 
+        let bg_upd_tx = upd_tx.clone();
         let mut state = Box::new(MainState {
+            tooltip: DarkTooltip::new(hwnd, scale),
             hwnd,
             config,
             stats,
             engine,
             tx,
             rx,
+            upd_tx,
+            upd_rx,
+            available_update: None,
+            updating: false,
             scale,
             font_ui,
             font_mono,
@@ -995,6 +1185,7 @@ pub fn run() {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
 
+        // Start ping worker threads
         let s = &mut *state_ptr;
         s.engine.start_workers(
             hwnd,
@@ -1003,6 +1194,17 @@ pub fn run() {
             s.config.timeout_ms,
             s.tx.clone(),
         );
+
+        // Silent background update check shortly after launch
+        let hwnd_raw = hwnd as isize;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1500));
+            if let UpdateStatus::Available(info) = check_for_updates() {
+                if bg_upd_tx.send(MainUpdateEvent::Available(info)).is_ok() {
+                    let _ = PostMessageW(hwnd_raw as HWND, WM_APP_UPDATE_EVENT, 0, 0);
+                }
+            }
+        });
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {

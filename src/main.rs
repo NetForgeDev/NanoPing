@@ -7,6 +7,7 @@ mod ui;
 mod updater;
 
 fn main() {
+    updater::cleanup_old_binaries();
     ui::win_util::init_process();
     ui::main_win::run();
 }

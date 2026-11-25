@@ -40,7 +40,8 @@ Engineered for minimal resource footprint (**~1.8 MB RAM**, **< 1 MB standalone 
   - Smooth 60 FPS wave fade animations with 4 speed profiles.
 - **Live Preview Settings:** Changes inside Settings preview immediately on the main window and cleanly revert if closed without saving.
 - **Smart Multi-Monitor Persistence:** Saves window coordinates immediately after moving and automatically recovers onto a connected display if a monitor is disconnected.
-- **Built-in Update Checker:** Lightweight native WinHTTP check for new GitHub releases inside the `About` dialog.
+- **Automatic Self-Updater:** Silently checks GitHub Releases on launch, displays a compact `UPD` badge when a new version is available, and performs a clean one-click in-place update without touching `config.ini`.
+- **Dark Floating Tooltips:** Native dark-themed hover tooltips for all compact header buttons (`UPD`, `SET`, `PIN`, `ICMP/TCP/UDP`, `RST`).
 
 ## Download
 

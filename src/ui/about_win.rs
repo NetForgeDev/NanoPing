@@ -14,30 +14,36 @@ use windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW,
-    RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, BN_CLICKED, BS_OWNERDRAW, GWLP_USERDATA, IDC_ARROW, MSG, SWP_NOZORDER,
-    SW_SHOW, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DRAWITEM,
-    WM_ERASEBKGND, WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, MessageBoxW,
+    PostMessageW, RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TranslateMessage, BN_CLICKED, BS_OWNERDRAW, GWLP_USERDATA, IDC_ARROW, IDYES,
+    MB_ICONQUESTION, MB_YESNO, MSG, SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_SETFONT, WNDCLASSEXW,
+    WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::ui::win_util::{
     apply_exe_icon, enable_dark_title_bar, get_dpi_scale, get_monitor_work_area,
-    open_url_in_browser, rgb, scale_px, to_wide, APP_NAME, APP_VERSION, BG_BOX,
-    GITHUB_RELEASES_URL, GITHUB_URL,
+    open_url_in_browser, rgb, scale_px, to_wide, APP_NAME, APP_VERSION, BG_BOX, GITHUB_URL,
 };
-use crate::updater::{check_for_updates, UpdateStatus};
+use crate::updater::{
+    check_for_updates, download_and_install_update, UpdateInfo, UpdateStatus,
+};
 
 const SS_CENTER: u32 = 0x0001;
 const SS_CENTERIMAGE: u32 = 0x0200;
 const ODS_SELECTED: u32 = 0x0001;
 
-const WM_APP_UPDATE_DONE: u32 = WM_APP + 2;
+const WM_APP_ABOUT_EVENT: u32 = WM_APP + 2;
 
 const ID_BTN_UPDATE: u16 = 301;
 const ID_BTN_GITHUB: u16 = 302;
 const ID_BTN_CLOSE: u16 = 303;
+
+enum AboutEvent {
+    CheckDone(UpdateStatus),
+    InstallDone(Result<(), String>),
+}
 
 struct AboutState {
     hwnd: HWND,
@@ -45,10 +51,11 @@ struct AboutState {
     scale: f32,
     closed: bool,
     checking: bool,
-    available_tag: Option<String>,
+    installing: bool,
+    available: Option<UpdateInfo>,
     status_color: u32,
-    tx: Sender<UpdateStatus>,
-    rx: Receiver<UpdateStatus>,
+    tx: Sender<AboutEvent>,
+    rx: Receiver<AboutEvent>,
     font_bold: HFONT,
     brush_bg: HBRUSH,
     lbl_title: HWND,
@@ -60,61 +67,117 @@ struct AboutState {
 }
 
 impl AboutState {
+    unsafe fn set_status(&mut self, text: &str, color: u32) {
+        self.status_color = color;
+        let w = to_wide(text);
+        SetWindowTextW(self.lbl_status, w.as_ptr());
+        InvalidateRect(self.lbl_status, ptr::null(), 1);
+        InvalidateRect(self.btn_update, ptr::null(), 0);
+    }
+
     unsafe fn start_update_check(&mut self) {
-        if self.checking {
+        if self.checking || self.installing {
             return;
         }
         self.checking = true;
-        self.status_color = rgb(0xaa, 0xaa, 0xaa);
-        let msg = to_wide("Checking GitHub for updates...");
-        SetWindowTextW(self.lbl_status, msg.as_ptr());
-        InvalidateRect(self.lbl_status, ptr::null(), 1);
-        InvalidateRect(self.btn_update, ptr::null(), 0);
+        self.set_status("Checking GitHub for updates...", rgb(0xaa, 0xaa, 0xaa));
 
         let tx = self.tx.clone();
         let hwnd_raw = self.hwnd as isize;
         thread::spawn(move || {
             let status = check_for_updates();
-            if tx.send(status).is_ok() {
-                let _ = PostMessageW(hwnd_raw as HWND, WM_APP_UPDATE_DONE, 0, 0);
+            if tx.send(AboutEvent::CheckDone(status)).is_ok() {
+                let _ = PostMessageW(hwnd_raw as HWND, WM_APP_ABOUT_EVENT, 0, 0);
             }
         });
     }
 
-    unsafe fn apply_update_result(&mut self, status: UpdateStatus) {
-        self.checking = false;
-        let text = match status {
-            UpdateStatus::UpToDate => {
-                self.available_tag = None;
-                self.status_color = rgb(0x00, 0xff, 0x66);
-                format!("Up to date (v{APP_VERSION})")
-            }
-            UpdateStatus::Available(tag) => {
-                let display_tag = if tag.starts_with('v') || tag.starts_with('V') {
-                    tag.clone()
-                } else {
-                    format!("v{tag}")
-                };
-                self.available_tag = Some(display_tag.clone());
-                self.status_color = rgb(0x00, 0xcc, 0xff);
-                format!("New release available: {display_tag}")
-            }
-            UpdateStatus::NoReleases => {
-                self.available_tag = None;
-                self.status_color = rgb(0xff, 0xaa, 0x00);
-                "No releases published on GitHub yet".to_string()
-            }
-            UpdateStatus::Failed => {
-                self.available_tag = None;
-                self.status_color = rgb(0xff, 0x44, 0x44);
-                "Could not connect to GitHub".to_string()
-            }
+    unsafe fn start_install(&mut self) {
+        if self.checking || self.installing {
+            return;
+        }
+        let Some(info) = self.available.clone() else {
+            return;
         };
 
-        let w = to_wide(&text);
-        SetWindowTextW(self.lbl_status, w.as_ptr());
-        InvalidateRect(self.lbl_status, ptr::null(), 1);
-        InvalidateRect(self.btn_update, ptr::null(), 0);
+        self.installing = true;
+        let display_tag = format_tag(&info.tag);
+        self.set_status(
+            &format!("Downloading & installing {display_tag}..."),
+            rgb(0x00, 0xcc, 0xff),
+        );
+
+        let tx = self.tx.clone();
+        let hwnd_raw = self.hwnd as isize;
+        thread::spawn(move || {
+            let res = download_and_install_update(&info.download_url);
+            if tx.send(AboutEvent::InstallDone(res)).is_ok() {
+                let _ = PostMessageW(hwnd_raw as HWND, WM_APP_ABOUT_EVENT, 0, 0);
+            }
+        });
+    }
+
+    unsafe fn confirm_and_install(&mut self) {
+        let Some(ref info) = self.available else {
+            return;
+        };
+        let display_tag = format_tag(&info.tag);
+        let prompt = to_wide(&format!(
+            "A new version of {APP_NAME} ({display_tag}) is available.\n\
+             Current version: v{APP_VERSION}\n\n\
+             Do you want to download, replace the current executable, and restart {APP_NAME} now?\n\
+             (Your settings in config.ini will be preserved.)"
+        ));
+        let caption = to_wide(&format!("Update Available — {APP_NAME}"));
+        let choice = MessageBoxW(
+            self.hwnd,
+            prompt.as_ptr(),
+            caption.as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        );
+        if choice == IDYES {
+            self.start_install();
+        }
+    }
+
+    unsafe fn apply_check_result(&mut self, status: UpdateStatus) {
+        self.checking = false;
+        match status {
+            UpdateStatus::UpToDate => {
+                self.available = None;
+                self.set_status(&format!("Up to date (v{APP_VERSION})"), rgb(0x00, 0xff, 0x66));
+            }
+            UpdateStatus::Available(info) => {
+                let display_tag = format_tag(&info.tag);
+                self.available = Some(info);
+                self.set_status(
+                    &format!("New release available: {display_tag}"),
+                    rgb(0x00, 0xcc, 0xff),
+                );
+                self.confirm_and_install();
+            }
+            UpdateStatus::NoReleases => {
+                self.available = None;
+                self.set_status("No releases published on GitHub yet", rgb(0xff, 0xaa, 0x00));
+            }
+            UpdateStatus::Failed => {
+                self.available = None;
+                self.set_status("Could not connect to GitHub", rgb(0xff, 0x44, 0x44));
+            }
+        }
+    }
+
+    unsafe fn apply_install_result(&mut self, res: Result<(), String>) {
+        self.installing = false;
+        match res {
+            Ok(()) => {
+                // New NanoPing.exe is already starting and will remove `.old` automatically.
+                std::process::exit(0);
+            }
+            Err(err) => {
+                self.set_status(&format!("Update failed: {err}"), rgb(0xff, 0x44, 0x44));
+            }
+        }
     }
 
     unsafe fn draw_button(&self, dis: &DRAWITEMSTRUCT) {
@@ -123,15 +186,22 @@ impl AboutState {
 
         let (text, bg, fg): (String, u32, u32) = match id {
             ID_BTN_UPDATE => {
-                if self.checking {
+                if self.installing {
+                    (
+                        "UPDATING...".to_string(),
+                        rgb(0x2a, 0x2a, 0x2a),
+                        rgb(0x00, 0xcc, 0xff),
+                    )
+                } else if self.checking {
                     (
                         "CHECKING...".to_string(),
                         rgb(0x2a, 0x2a, 0x2a),
                         rgb(0x88, 0x88, 0x88),
                     )
-                } else if let Some(ref tag) = self.available_tag {
+                } else if let Some(ref info) = self.available {
+                    let display_tag = format_tag(&info.tag);
                     (
-                        format!("DOWNLOAD {tag}"),
+                        format!("INSTALL {display_tag}"),
                         rgb(0x00, 0x99, 0x44),
                         rgb(0xff, 0xff, 0xff),
                     )
@@ -203,10 +273,21 @@ impl AboutState {
     }
 
     unsafe fn close(&mut self) {
+        if self.installing {
+            return;
+        }
         self.closed = true;
         EnableWindow(self.parent, 1);
         SetFocus(self.parent);
         DestroyWindow(self.hwnd);
+    }
+}
+
+fn format_tag(tag: &str) -> String {
+    if tag.starts_with('v') || tag.starts_with('V') {
+        tag.to_string()
+    } else {
+        format!("v{tag}")
     }
 }
 
@@ -255,9 +336,12 @@ unsafe extern "system" fn about_wnd_proc(
             state.draw_button(dis);
             1
         }
-        WM_APP_UPDATE_DONE => {
-            if let Ok(status) = state.rx.try_recv() {
-                state.apply_update_result(status);
+        WM_APP_ABOUT_EVENT => {
+            while let Ok(ev) = state.rx.try_recv() {
+                match ev {
+                    AboutEvent::CheckDone(s) => state.apply_check_result(s),
+                    AboutEvent::InstallDone(r) => state.apply_install_result(r),
+                }
             }
             0
         }
@@ -267,8 +351,8 @@ unsafe extern "system" fn about_wnd_proc(
             if code == BN_CLICKED {
                 match id {
                     ID_BTN_UPDATE => {
-                        if state.available_tag.is_some() {
-                            open_url_in_browser(GITHUB_RELEASES_URL);
+                        if state.available.is_some() {
+                            state.confirm_and_install();
                         } else {
                             state.start_update_check();
                         }
@@ -366,7 +450,16 @@ pub fn show_about_dialog(parent: HWND) {
         let cls_static = to_wide("STATIC");
         let cls_btn = to_wide("BUTTON");
 
-        let make_ctrl = |class: &[u16], text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: u16, font: HFONT| -> HWND {
+        let make_ctrl = |class: &[u16],
+                         text: &str,
+                         style: u32,
+                         x: i32,
+                         y: i32,
+                         w: i32,
+                         h: i32,
+                         id: u16,
+                         font: HFONT|
+         -> HWND {
             let wt = to_wide(text);
             let ch = CreateWindowExW(
                 0,
@@ -387,28 +480,108 @@ pub fn show_about_dialog(parent: HWND) {
         };
 
         let mut y = px(14);
-        let lbl_title = make_ctrl(&cls_static, APP_NAME, SS_CENTER | SS_CENTERIMAGE, pad, y, content_w, px(26), 0, font_title);
+        let lbl_title = make_ctrl(
+            &cls_static,
+            APP_NAME,
+            SS_CENTER | SS_CENTERIMAGE,
+            pad,
+            y,
+            content_w,
+            px(26),
+            0,
+            font_title,
+        );
         y += px(26);
 
-        let lbl_version = make_ctrl(&cls_static, &format!("Version {APP_VERSION}"), SS_CENTER | SS_CENTERIMAGE, pad, y, content_w, px(18), 0, font_bold);
+        let lbl_version = make_ctrl(
+            &cls_static,
+            &format!("Version {APP_VERSION}"),
+            SS_CENTER | SS_CENTERIMAGE,
+            pad,
+            y,
+            content_w,
+            px(18),
+            0,
+            font_bold,
+        );
         y += px(22);
 
-        let lbl_desc = make_ctrl(&cls_static, "Ultra-lightweight native Windows ping monitor", SS_CENTER | SS_CENTERIMAGE, pad, y, content_w, px(18), 0, font_regular);
+        let lbl_desc = make_ctrl(
+            &cls_static,
+            "Ultra-lightweight native Windows ping monitor",
+            SS_CENTER | SS_CENTERIMAGE,
+            pad,
+            y,
+            content_w,
+            px(18),
+            0,
+            font_regular,
+        );
         y += px(18);
 
-        let lbl_credit = make_ctrl(&cls_static, "NetForgeDev  •  MIT License", SS_CENTER | SS_CENTERIMAGE, pad, y, content_w, px(18), 0, font_small);
+        let lbl_credit = make_ctrl(
+            &cls_static,
+            "NetForgeDev  •  MIT License",
+            SS_CENTER | SS_CENTERIMAGE,
+            pad,
+            y,
+            content_w,
+            px(18),
+            0,
+            font_small,
+        );
         y += px(26);
 
-        let lbl_status = make_ctrl(&cls_static, "Ready to check for updates", SS_CENTER | SS_CENTERIMAGE, pad, y, content_w, px(20), 0, font_small);
+        let lbl_status = make_ctrl(
+            &cls_static,
+            "Ready to check for updates",
+            SS_CENTER | SS_CENTERIMAGE,
+            pad,
+            y,
+            content_w,
+            px(20),
+            0,
+            font_small,
+        );
         y += px(24);
 
-        let btn_update = make_ctrl(&cls_btn, "CHECK FOR UPDATES", WS_TABSTOP | BS_OWNERDRAW as u32, pad, y, content_w, px(26), ID_BTN_UPDATE, font_bold);
+        let btn_update = make_ctrl(
+            &cls_btn,
+            "CHECK FOR UPDATES",
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+            pad,
+            y,
+            content_w,
+            px(26),
+            ID_BTN_UPDATE,
+            font_bold,
+        );
         y += px(34);
 
         let b_gap = px(8);
         let half_w = (content_w - b_gap) / 2;
-        make_ctrl(&cls_btn, "GITHUB", WS_TABSTOP | BS_OWNERDRAW as u32, pad, y, half_w, px(26), ID_BTN_GITHUB, font_bold);
-        make_ctrl(&cls_btn, "CLOSE", WS_TABSTOP | BS_OWNERDRAW as u32, pad + half_w + b_gap, y, half_w, px(26), ID_BTN_CLOSE, font_bold);
+        make_ctrl(
+            &cls_btn,
+            "GITHUB",
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+            pad,
+            y,
+            half_w,
+            px(26),
+            ID_BTN_GITHUB,
+            font_bold,
+        );
+        make_ctrl(
+            &cls_btn,
+            "CLOSE",
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+            pad + half_w + b_gap,
+            y,
+            half_w,
+            px(26),
+            ID_BTN_CLOSE,
+            font_bold,
+        );
         y += px(26) + px(14);
 
         let mut r = RECT {
@@ -417,7 +590,12 @@ pub fn show_about_dialog(parent: HWND) {
             right: client_w,
             bottom: y,
         };
-        AdjustWindowRectEx(&mut r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, 0, WS_EX_DLGMODALFRAME);
+        AdjustWindowRectEx(
+            &mut r,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            0,
+            WS_EX_DLGMODALFRAME,
+        );
         let win_w = r.right - r.left;
         let win_h = r.bottom - r.top;
 
@@ -426,8 +604,16 @@ pub fn show_about_dialog(parent: HWND) {
         let mon = get_monitor_work_area(parent);
         let mut x = pr.left + ((pr.right - pr.left) - win_w) / 2;
         let mut top_y = pr.top + ((pr.bottom - pr.top) - win_h) / 2;
-        if x < mon.left + 10 { x = mon.left + 10; } else if x + win_w > mon.right - 10 { x = mon.right - win_w - 10; }
-        if top_y < mon.top + 10 { top_y = mon.top + 10; } else if top_y + win_h > mon.bottom - 10 { top_y = mon.bottom - win_h - 10; }
+        if x < mon.left + 10 {
+            x = mon.left + 10;
+        } else if x + win_w > mon.right - 10 {
+            x = mon.right - win_w - 10;
+        }
+        if top_y < mon.top + 10 {
+            top_y = mon.top + 10;
+        } else if top_y + win_h > mon.bottom - 10 {
+            top_y = mon.bottom - win_h - 10;
+        }
         SetWindowPos(hwnd, ptr::null_mut(), x, top_y, win_w, win_h, SWP_NOZORDER);
 
         let (tx, rx) = mpsc::channel();
@@ -437,7 +623,8 @@ pub fn show_about_dialog(parent: HWND) {
             scale,
             closed: false,
             checking: false,
-            available_tag: None,
+            installing: false,
+            available: None,
             status_color: rgb(0x77, 0x77, 0x77),
             tx,
             rx,
