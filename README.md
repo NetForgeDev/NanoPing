@@ -73,6 +73,7 @@ Get-FileHash NanoPing.exe -Algorithm SHA256
 | `wave_effect` | Enable wave fade animation on updates | `True` |
 | `wave_speed` | `normal`, `slow`, `fast`, or `very fast` | `normal` |
 | `font_size` | Unified proportional UI font size (`9`–`28`) | `14` |
+| `opacity` | Main window opacity percentage (`25`–`100`) | `100` |
 | `color_low` | Hex color for latency `< 100ms` | `#00cc55` |
 | `color_medium` | Hex color for latency `100–200ms` | `#e6e600` |
 | `color_high` | Hex color for latency `> 200ms` | `#e68a00` |

@@ -13,8 +13,8 @@ use windows_sys::Win32::UI::Shell::{
     ExtractIconW, SetCurrentProcessExplicitAppUserModelID, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SendMessageW, SetProcessDPIAware, ICON_BIG, ICON_SMALL, SM_CXSCREEN,
-    SM_CYSCREEN, SW_SHOWNORMAL, WM_SETICON,
+    GetSystemMetrics, SendMessageW, SetProcessDPIAware, SetLayeredWindowAttributes, ICON_BIG, ICON_SMALL, SM_CXSCREEN,
+    SM_CYSCREEN, SW_SHOWNORMAL, WM_SETICON, LWA_ALPHA
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
@@ -283,5 +283,13 @@ pub fn pick_color_dialog(owner: HWND, initial: u32) -> Option<u32> {
         } else {
             None
         }
+    }
+}
+
+pub fn apply_window_opacity(hwnd: HWND, opacity_pct: u8) {
+    let pct = opacity_pct.clamp(25, 100);
+    let alpha = ((pct as u32 * 255 + 50) / 100).clamp(64, 255) as u8;
+    unsafe {
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
     }
 }

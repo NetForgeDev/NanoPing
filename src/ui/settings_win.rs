@@ -54,6 +54,8 @@ const ID_COLOR_LOW_BTN: u16 = 113;
 const ID_COLOR_MED_BTN: u16 = 114;
 const ID_COLOR_HIGH_BTN: u16 = 115;
 const ID_COLOR_TO_BTN: u16 = 116;
+const ID_OPACITY_DEC_BTN: u16 = 117;
+const ID_OPACITY_INC_BTN: u16 = 118;
 
 const ID_EDIT_HIST: u16 = 200;
 const ID_EDIT_LOSS: u16 = 201;
@@ -61,6 +63,7 @@ const ID_EDIT_AVG: u16 = 202;
 const ID_EDIT_REF: u16 = 203;
 const ID_EDIT_TIMEOUT: u16 = 204;
 const ID_EDIT_FONT: u16 = 205;
+const ID_EDIT_OPACITY: u16 = 206;
 
 const ID_TARGET_EDIT_BASE: u16 = 1000;
 const ID_TARGET_DEL_BASE: u16 = 2000;
@@ -79,6 +82,7 @@ struct Draft {
     wave_effect: bool,
     wave_speed: WaveSpeed,
     font_size: String,
+    opacity: String,
     colors: PingColors,
 }
 
@@ -98,6 +102,7 @@ impl Draft {
             wave_effect: c.wave_effect,
             wave_speed: c.wave_speed,
             font_size: c.font_size.to_string(),
+            opacity: c.opacity.to_string(),
             colors: c.colors,
         }
     }
@@ -124,6 +129,7 @@ struct SettingsState {
     edit_ref: HWND,
     edit_timeout: HWND,
     edit_font: HWND,
+    edit_opacity: HWND,
 }
 
 unsafe fn get_edit_text(hwnd: HWND) -> String {
@@ -148,6 +154,7 @@ impl SettingsState {
         self.draft.refresh = get_edit_text(self.edit_ref);
         self.draft.timeout = get_edit_text(self.edit_timeout);
         self.draft.font_size = get_edit_text(self.edit_font);
+        self.draft.opacity = get_edit_text(self.edit_opacity);
     }
 
     unsafe fn emit_live_preview(&mut self) {
@@ -199,6 +206,11 @@ impl SettingsState {
                 cfg.font_size = v;
             }
         }
+        if let Ok(v) = self.draft.opacity.trim().parse::<u8>() {
+            if (25..=100).contains(&v) {
+                cfg.opacity = v;
+            }
+        }
         cfg.always_on_top = self.draft.always_on_top;
         cfg.save_position = self.draft.save_position;
         cfg.autostart = self.draft.autostart;
@@ -228,6 +240,25 @@ impl SettingsState {
         self.building_ui = true;
         let w = to_wide(&self.draft.font_size);
         SetWindowTextW(self.edit_font, w.as_ptr());
+        self.building_ui = false;
+
+        self.emit_live_preview();
+    }
+
+    unsafe fn step_opacity(&mut self, delta: i32) {
+        self.sync_edits_to_draft();
+        let cur = self
+            .draft
+            .opacity
+            .trim()
+            .parse::<i32>()
+            .unwrap_or(self.base_config.opacity as i32);
+        let next = (cur + delta).clamp(25, 100) as u8;
+        self.draft.opacity = next.to_string();
+
+        self.building_ui = true;
+        let w = to_wide(&self.draft.opacity);
+        SetWindowTextW(self.edit_opacity, w.as_ptr());
         self.building_ui = false;
 
         self.emit_live_preview();
@@ -511,7 +542,7 @@ impl SettingsState {
         );
         let step_btn_w = px(22);
         let step_gap = px(3);
-        let font_edit_w = right_w - step_btn_w * 2 - step_gap * 2;
+        let step_edit_w = right_w - step_btn_w * 2 - step_gap * 2;
         add_ctrl(
             &cls_btn,
             "-",
@@ -529,7 +560,7 @@ impl SettingsState {
             WS_TABSTOP | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL,
             right_x + step_btn_w + step_gap,
             y,
-            font_edit_w,
+            step_edit_w,
             item_h,
             ID_EDIT_FONT,
             self.font_regular,
@@ -538,11 +569,58 @@ impl SettingsState {
             &cls_btn,
             "+",
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            right_x + step_btn_w + step_gap + font_edit_w + step_gap,
+            right_x + step_btn_w + step_gap + step_edit_w + step_gap,
             y,
             step_btn_w,
             item_h,
             ID_FONT_INC_BTN,
+            self.font_bold,
+        );
+        y += item_step;
+
+        // Opacity stepper: [-] [100] [+]
+        add_ctrl(
+            &cls_static,
+            "Opacity % (25-100):",
+            SS_LEFT | SS_CENTERIMAGE,
+            pad,
+            y,
+            lbl_w,
+            item_h,
+            0,
+            self.font_regular,
+        );
+        add_ctrl(
+            &cls_btn,
+            "-",
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+            right_x,
+            y,
+            step_btn_w,
+            item_h,
+            ID_OPACITY_DEC_BTN,
+            self.font_bold,
+        );
+        self.edit_opacity = add_ctrl(
+            &cls_edit,
+            &self.draft.opacity.clone(),
+            WS_TABSTOP | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL,
+            right_x + step_btn_w + step_gap,
+            y,
+            step_edit_w,
+            item_h,
+            ID_EDIT_OPACITY,
+            self.font_regular,
+        );
+        add_ctrl(
+            &cls_btn,
+            "+",
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+            right_x + step_btn_w + step_gap + step_edit_w + step_gap,
+            y,
+            step_btn_w,
+            item_h,
+            ID_OPACITY_INC_BTN,
             self.font_bold,
         );
         y += item_step + px(2);
@@ -702,7 +780,6 @@ impl SettingsState {
         DeleteObject(brush as _);
         DeleteObject(pen as _);
 
-        // Color swatch square on left
         let sw = scale_px(10, self.scale);
         let sw_x = dis.rcItem.left + scale_px(7, self.scale);
         let sw_y = dis.rcItem.top + ((dis.rcItem.bottom - dis.rcItem.top) - sw) / 2;
@@ -724,7 +801,6 @@ impl SettingsState {
         DeleteObject(sw_brush as _);
         DeleteObject(sw_pen as _);
 
-        // Label on right of swatch
         SetBkMode(hdc, TRANSPARENT as i32);
         SetTextColor(hdc, rgb(0xdd, 0xdd, 0xdd));
         SelectObject(hdc, self.font_bold as _);
@@ -794,8 +870,12 @@ impl SettingsState {
                 rgb(0x22, 0x22, 0x22),
                 speed_color(self.draft.wave_speed),
             ),
-            ID_FONT_DEC_BTN => ("-".to_string(), rgb(0x24, 0x24, 0x24), rgb(0xff, 0xff, 0xff)),
-            ID_FONT_INC_BTN => ("+".to_string(), rgb(0x24, 0x24, 0x24), rgb(0xff, 0xff, 0xff)),
+            ID_FONT_DEC_BTN | ID_OPACITY_DEC_BTN => {
+                ("-".to_string(), rgb(0x24, 0x24, 0x24), rgb(0xff, 0xff, 0xff))
+            }
+            ID_FONT_INC_BTN | ID_OPACITY_INC_BTN => {
+                ("+".to_string(), rgb(0x24, 0x24, 0x24), rgb(0xff, 0xff, 0xff))
+            }
             ID_DEFAULTS_BTN => (
                 "DEFAULTS".to_string(),
                 rgb(0xcc, 0x33, 0x33),
@@ -883,14 +963,15 @@ impl SettingsState {
             return;
         }
 
-        let parsed = (|| -> Option<(usize, usize, usize, u64, u64, u32)> {
+        let parsed = (|| -> Option<(usize, usize, usize, u64, u64, u32, u8)> {
             let hist = self.draft.hist.trim().parse::<usize>().ok()?.clamp(1, 20);
             let loss = self.draft.loss.trim().parse::<usize>().ok()?.max(1);
             let avg = self.draft.avg.trim().parse::<usize>().ok()?.max(1);
             let refresh = self.draft.refresh.trim().parse::<u64>().ok()?.max(50);
             let timeout = self.draft.timeout.trim().parse::<u64>().ok()?.max(100);
             let font_size = self.draft.font_size.trim().parse::<u32>().ok()?.clamp(9, 28);
-            Some((hist, loss, avg, refresh, timeout, font_size))
+            let opacity = self.draft.opacity.trim().parse::<u8>().ok()?.clamp(25, 100);
+            Some((hist, loss, avg, refresh, timeout, font_size, opacity))
         })();
 
         let Some((
@@ -900,6 +981,7 @@ impl SettingsState {
             refresh_interval_ms,
             timeout_ms,
             font_size,
+            opacity,
         )) = parsed
         else {
             let msg = to_wide("Please enter valid numeric values.");
@@ -922,6 +1004,7 @@ impl SettingsState {
         cfg.wave_effect = self.draft.wave_effect;
         cfg.wave_speed = self.draft.wave_speed;
         cfg.font_size = font_size;
+        cfg.opacity = opacity;
         cfg.colors = self.draft.colors;
 
         self.result = Some(cfg);
@@ -1032,6 +1115,12 @@ unsafe extern "system" fn settings_wnd_proc(
                     ID_FONT_INC_BTN => {
                         state.step_font_size(1);
                     }
+                    ID_OPACITY_DEC_BTN => {
+                        state.step_opacity(-5);
+                    }
+                    ID_OPACITY_INC_BTN => {
+                        state.step_opacity(5);
+                    }
                     ID_COLOR_LOW_BTN => {
                         if let Some(c) = pick_color_dialog(hwnd, state.draft.colors.low) {
                             state.draft.colors.low = c;
@@ -1125,7 +1214,7 @@ pub fn show_settings_dialog(parent: HWND, current: &Config) -> Option<Config> {
             0,
             0,
             320,
-            500,
+            520,
             parent,
             ptr::null_mut(),
             hinst,
@@ -1196,6 +1285,7 @@ pub fn show_settings_dialog(parent: HWND, current: &Config) -> Option<Config> {
             edit_ref: ptr::null_mut(),
             edit_timeout: ptr::null_mut(),
             edit_font: ptr::null_mut(),
+            edit_opacity: ptr::null_mut(),
         });
 
         let state_ptr = &mut *state as *mut SettingsState;

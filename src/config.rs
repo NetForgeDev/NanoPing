@@ -157,6 +157,7 @@ pub struct Config {
     pub wave_effect: bool,
     pub wave_speed: WaveSpeed,
     pub font_size: u32,
+    pub opacity: u8,
     pub colors: PingColors,
 }
 
@@ -182,6 +183,7 @@ impl Default for Config {
             wave_effect: true,
             wave_speed: WaveSpeed::Normal,
             font_size: 14,
+            opacity: 100,
             colors: PingColors::default(),
         }
     }
@@ -271,6 +273,7 @@ impl Config {
             "color_medium",
             "color_high",
             "color_timeout",
+            "opacity",
         ];
         let needs_rewrite = expected_keys.iter().any(|k| !map.contains_key(*k));
 
@@ -373,6 +376,12 @@ impl Config {
                 .map(|v| v.clamp(9, 28))
                 .unwrap_or(defaults.font_size),
             colors,
+            opacity: map
+                .get("opacity")
+                .and_then(|v| v.parse::<u8>().ok())
+                .map(|v| v.clamp(25, 100))
+                .unwrap_or(defaults.opacity),
+            
         };
 
         if needs_rewrite {
@@ -408,6 +417,7 @@ autostart = {autostart}\n\
 wave_effect = {wave_effect}\n\
 wave_speed = {wave_speed}\n\
 font_size = {font_size}\n\
+opacity = {opacity}\n\
 color_low = {color_low}\n\
 color_medium = {color_medium}\n\
 color_high = {color_high}\n\
@@ -426,6 +436,7 @@ color_timeout = {color_timeout}\n",
             wave_effect = fmt_bool(self.wave_effect),
             wave_speed = self.wave_speed.as_str(),
             font_size = self.font_size,
+            opacity = self.opacity,
             color_low = format_hex_color(self.colors.low),
             color_medium = format_hex_color(self.colors.medium),
             color_high = format_hex_color(self.colors.high),

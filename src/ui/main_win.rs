@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_EXITSIZEMOVE,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
-    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,WM_LBUTTONDOWN,
+    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,WM_LBUTTONDOWN,WS_EX_LAYERED,
 };
 
 use crate::config::{set_autostart, Config};
@@ -36,7 +36,7 @@ use crate::ui::settings_win::show_settings_dialog;
 use crate::ui::tooltip::DarkTooltip;
 use crate::ui::win_util::{
     apply_exe_icon, enable_dark_title_bar, get_dpi_scale, method_color,
-    resolve_safe_window_position, rgb, scale_px, to_wide, APP_NAME, APP_VERSION, BG_BOX, BG_BTN,
+    resolve_safe_window_position, rgb, scale_px, to_wide,apply_window_opacity , APP_NAME, APP_VERSION, BG_BOX, BG_BTN,
     BG_BTN_HOVER, BG_MAIN,
 };
 use crate::updater::{
@@ -415,6 +415,7 @@ impl MainState {
 
         let topmost_changed = new_cfg.always_on_top != self.config.always_on_top;
         let font_changed = new_cfg.font_size != self.config.font_size;
+        let opacity_changed = new_cfg.opacity != self.config.opacity;
 
         if persist {
             new_cfg.save();
@@ -424,6 +425,9 @@ impl MainState {
 
         if font_changed {
             self.recreate_fonts();
+        }
+        if opacity_changed {
+            apply_window_opacity(self.hwnd, self.config.opacity);
         }
 
         if topmost_changed {
@@ -1113,11 +1117,7 @@ pub fn run() {
         };
         RegisterClassExW(&wc);
 
-        let ex_style = if config.always_on_top {
-            WS_EX_TOPMOST
-        } else {
-            0
-        };
+        let ex_style = WS_EX_LAYERED | if config.always_on_top { WS_EX_TOPMOST } else { 0 };
         let title = to_wide(APP_NAME);
         let hwnd = CreateWindowExW(
             ex_style,
@@ -1139,6 +1139,7 @@ pub fn run() {
 
         enable_dark_title_bar(hwnd);
         apply_exe_icon(hwnd);
+        apply_window_opacity(hwnd, config.opacity);
 
         let scale = get_dpi_scale(hwnd);
         let (font_ui, font_mono, font_hist, font_sep) =
@@ -1155,7 +1156,6 @@ pub fn run() {
 
         let bg_upd_tx = upd_tx.clone();
         let mut state = Box::new(MainState {
-            tooltip: DarkTooltip::new(hwnd, scale),
             hwnd,
             config,
             stats,
@@ -1175,6 +1175,7 @@ pub fn run() {
             hovered_btn: None,
             tracking_mouse: false,
             anim_timer_active: false,
+            tooltip: DarkTooltip::new(hwnd, scale),
         });
 
         state.apply_size_and_position(true);
