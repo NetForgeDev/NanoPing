@@ -33,6 +33,7 @@ use crate::ui::win_util::{
 const ES_CENTER: u32 = 0x0001;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 const EN_CHANGE_CODE: u32 = 0x0300;
+const BN_DOUBLECLICKED_CODE: u32 = 5;
 const SS_LEFT: u32 = 0x0000;
 const SS_CENTERIMAGE: u32 = 0x0200;
 const ODS_SELECTED: u32 = 0x0001;
@@ -1084,7 +1085,9 @@ unsafe extern "system" fn settings_wnd_proc(
             let code = ((wparam >> 16) & 0xFFFF) as u32;
             if code == EN_CHANGE_CODE {
                 state.emit_live_preview();
-            } else if code == BN_CLICKED {
+            } else if code == BN_CLICKED
+                || (code == BN_DOUBLECLICKED_CODE && id != ID_OPEN_INI_BTN)
+            {
                 match id {
                     ID_ABOUT_BTN => {
                         show_about_dialog(hwnd);
