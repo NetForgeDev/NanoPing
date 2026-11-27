@@ -445,7 +445,7 @@ pub fn show_about_dialog(parent: HWND) {
         let brush_bg = CreateSolidBrush(BG_BOX);
 
         let pad = px(16);
-        let client_w = px(290);
+        let client_w = px(330);
         let content_w = client_w - pad * 2;
         let cls_static = to_wide("STATIC");
         let cls_btn = to_wide("BUTTON");

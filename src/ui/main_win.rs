@@ -51,6 +51,9 @@ const WM_DISPLAYCHANGE: u32 = 0x007E;
 const ANIM_TIMER_ID: usize = 1;
 const TOOLTIP_TIMER_ID: usize = 2;
 const TOOLTIP_DELAY_MS: u32 = 450;
+const WM_SETTINGCHANGE: u32 = 0x001A;
+const SPI_SETWORKAREA: usize = 0x002F;
+const SETTLE_TIMER_ID: usize = 3;
 
 const WINDOW_STYLE: u32 = WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU;
 
@@ -322,12 +325,7 @@ impl MainState {
             } else {
                 (None, None)
             };
-            let (x, y, adjusted) = resolve_safe_window_position(sx, sy, w, h);
-            if adjusted && self.config.save_position && sx.is_some() && sy.is_some() {
-                self.config.window_x = Some(x);
-                self.config.window_y = Some(y);
-                self.config.save();
-            }
+            let (x, y, _) = resolve_safe_window_position(sx, sy, w, h);
             let z = if self.config.always_on_top {
                 HWND_TOPMOST
             } else {
@@ -355,10 +353,17 @@ impl MainState {
         if GetWindowRect(self.hwnd, &mut rect) == 0 {
             return;
         }
-        let w = rect.right - rect.left;
-        let h = rect.bottom - rect.top;
-        let (x, y, adjusted) = resolve_safe_window_position(Some(rect.left), Some(rect.top), w, h);
-        if adjusted {
+        let (w, h) = self.calc_window_size();
+        let (target_x, target_y) = if self.config.save_position {
+            (
+                self.config.window_x.or(Some(rect.left)),
+                self.config.window_y.or(Some(rect.top)),
+            )
+        } else {
+            (Some(rect.left), Some(rect.top))
+        };
+        let (x, y, _) = resolve_safe_window_position(target_x, target_y, w, h);
+        if rect.left != x || rect.top != y {
             SetWindowPos(
                 self.hwnd,
                 ptr::null_mut(),
@@ -368,11 +373,6 @@ impl MainState {
                 h,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            if self.config.save_position {
-                self.config.window_x = Some(x);
-                self.config.window_y = Some(y);
-                self.config.save();
-            }
         }
     }
 
@@ -1013,14 +1013,17 @@ unsafe extern "system" fn main_wnd_proc(
             } else if wparam == TOOLTIP_TIMER_ID {
                 KillTimer(hwnd, TOOLTIP_TIMER_ID);
                 if let Some(kind) = state.hovered_btn {
-                    if let Some(btn) = state.layout.buttons.iter().find(|b| b.kind == kind) {
-                        let text = state.tooltip_text(kind);
-                        state.tooltip.show(hwnd, btn.rect, &text);
+                        if let Some(btn) = state.layout.buttons.iter().find(|b| b.kind == kind) {
+                            let text = state.tooltip_text(kind);
+                            state.tooltip.show(hwnd, btn.rect, &text);
+                        }
                     }
+                } else if wparam == SETTLE_TIMER_ID {
+                    KillTimer(hwnd, SETTLE_TIMER_ID);
+                    state.ensure_on_connected_monitor();
                 }
+                0
             }
-            0
-        }
 
         WM_MOUSEMOVE => {
             let state = &mut *state_ptr;
@@ -1117,6 +1120,8 @@ unsafe extern "system" fn main_wnd_proc(
             0
         }
         WM_EXITSIZEMOVE => {
+            KillTimer(hwnd, SETTLE_TIMER_ID);
+            (*state_ptr).cancel_tooltip();
             (*state_ptr).save_current_position_immediately();
             0
         }
@@ -1125,10 +1130,16 @@ unsafe extern "system" fn main_wnd_proc(
             (*state_ptr).ensure_on_connected_monitor();
             0
         }
+        WM_SETTINGCHANGE => {
+            if wparam == SPI_SETWORKAREA {
+                (*state_ptr).ensure_on_connected_monitor();
+            }
+            0
+        }
         WM_CLOSE => {
+            KillTimer(hwnd, SETTLE_TIMER_ID);
             (*state_ptr).cancel_tooltip();
             let state = &mut *state_ptr;
-            state.save_current_position_immediately();
             state.stop_anim_timer();
             state.engine.stop();
             DestroyWindow(hwnd);
@@ -1239,6 +1250,14 @@ pub fn run() {
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+
+        // Re-verify saved position once desktop/monitors finish settling after Windows boot
+        if (*state_ptr).config.save_position
+            && (*state_ptr).config.window_x.is_some()
+            && (*state_ptr).config.window_y.is_some()
+        {
+            SetTimer(hwnd, SETTLE_TIMER_ID, 2500, None);
+        }
 
         // Start ping worker threads
         let s = &mut *state_ptr;
