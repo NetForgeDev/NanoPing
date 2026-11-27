@@ -158,6 +158,7 @@ pub struct Config {
     pub wave_speed: WaveSpeed,
     pub font_size: u32,
     pub opacity: u8,
+    pub check_updates: bool,
     pub colors: PingColors,
 }
 
@@ -184,6 +185,7 @@ impl Default for Config {
             wave_speed: WaveSpeed::Normal,
             font_size: 14,
             opacity: 100,
+            check_updates: true,
             colors: PingColors::default(),
         }
     }
@@ -274,6 +276,7 @@ impl Config {
             "color_high",
             "color_timeout",
             "opacity",
+            "check_updates",
         ];
         let needs_rewrite = expected_keys.iter().any(|k| !map.contains_key(*k));
 
@@ -381,7 +384,10 @@ impl Config {
                 .and_then(|v| v.parse::<u8>().ok())
                 .map(|v| v.clamp(25, 100))
                 .unwrap_or(defaults.opacity),
-            
+            check_updates: map
+                .get("check_updates")
+                .map(|v| parse_bool(v, defaults.check_updates))
+                .unwrap_or(defaults.check_updates),
         };
 
         if needs_rewrite {
@@ -418,6 +424,7 @@ wave_effect = {wave_effect}\n\
 wave_speed = {wave_speed}\n\
 font_size = {font_size}\n\
 opacity = {opacity}\n\
+check_updates = {check_updates}\n\
 color_low = {color_low}\n\
 color_medium = {color_medium}\n\
 color_high = {color_high}\n\
@@ -437,6 +444,7 @@ color_timeout = {color_timeout}\n",
             wave_speed = self.wave_speed.as_str(),
             font_size = self.font_size,
             opacity = self.opacity,
+            check_updates = fmt_bool(self.check_updates),
             color_low = format_hex_color(self.colors.low),
             color_medium = format_hex_color(self.colors.medium),
             color_high = format_hex_color(self.colors.high),

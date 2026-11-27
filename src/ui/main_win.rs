@@ -3,12 +3,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode,
-    SetTextColor, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
+    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, RoundRect, ScreenToClient, SelectObject,
+    SetBkMode, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HFONT, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
@@ -22,11 +22,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, IsIconic, KillTimer,
     LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IDYES,
-    MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_EXITSIZEMOVE,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
-    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,WM_LBUTTONDOWN,WS_EX_LAYERED,
+    CS_VREDRAW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
+    IDC_HAND, IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MSG, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST,
+    WM_NCLBUTTONDBLCLK, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
 };
 
 use crate::config::{set_autostart, Config};
@@ -35,8 +36,8 @@ use crate::state::AppStats;
 use crate::ui::settings_win::show_settings_dialog;
 use crate::ui::tooltip::DarkTooltip;
 use crate::ui::win_util::{
-    apply_exe_icon, enable_dark_title_bar, get_dpi_scale, method_color,
-    resolve_safe_window_position, rgb, scale_px, to_wide,apply_window_opacity , APP_NAME, APP_VERSION, BG_BOX, BG_BTN,
+    apply_exe_icon, apply_window_opacity, enable_borderless_frame, get_dpi_scale, method_color,
+    resolve_safe_window_position, rgb, scale_px, to_wide, APP_NAME, APP_VERSION, BG_BOX, BG_BTN,
     BG_BTN_HOVER, BG_MAIN,
 };
 use crate::updater::{
@@ -51,7 +52,7 @@ const ANIM_TIMER_ID: usize = 1;
 const TOOLTIP_TIMER_ID: usize = 2;
 const TOOLTIP_DELAY_MS: u32 = 450;
 
-const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+const WINDOW_STYLE: u32 = WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TopBtn {
@@ -60,6 +61,8 @@ enum TopBtn {
     Pin,
     Method,
     Reset,
+    Minimize,
+    Close,
 }
 
 struct ButtonRect {
@@ -183,9 +186,9 @@ impl MainState {
         let ratio = (cfg.font_size.clamp(9, 28) as f32) / 14.0;
         let s = scale * ratio;
 
-        let pad_x = scale_px(6, s);
-        let pad_bottom = scale_px(4, s);
-        let top_h = scale_px(24, s);
+        let pad_x = scale_px(7, s);
+        let pad_bottom = scale_px(5, s);
+        let top_h = scale_px(26, s);
         let row_h = scale_px(21, s);
         let gap = scale_px(4, s);
 
@@ -216,7 +219,7 @@ impl MainState {
         let btn_pad_x = scale_px(5, s);
         let btn_gap = scale_px(3, s);
 
-        let mut btn_labels: Vec<(TopBtn, &str)> = Vec::with_capacity(5);
+        let mut btn_labels: Vec<(TopBtn, &str)> = Vec::with_capacity(7);
         if show_update_btn {
             btn_labels.push((TopBtn::Update, "UPD"));
         }
@@ -224,11 +227,18 @@ impl MainState {
         btn_labels.push((TopBtn::Pin, "PIN"));
         btn_labels.push((TopBtn::Method, "ICMP"));
         btn_labels.push((TopBtn::Reset, "RST"));
+        btn_labels.push((TopBtn::Minimize, "\u{2212}"));
+        btn_labels.push((TopBtn::Close, "\u{00D7}"));
 
+        let min_ctrl_w = scale_px(18, s);
+        let ctrl_sep = scale_px(5, s);
         let mut btn_widths = Vec::with_capacity(btn_labels.len());
-        let mut total_btns_w = 0;
+        let mut total_btns_w = ctrl_sep;
         for (kind, text) in btn_labels {
-            let w = Self::measure_char_width(hwnd, font_ui, text) + btn_pad_x * 2;
+            let mut w = Self::measure_char_width(hwnd, font_ui, text) + btn_pad_x * 2;
+            if kind == TopBtn::Minimize || kind == TopBtn::Close {
+                w = w.max(min_ctrl_w);
+            }
             btn_widths.push((kind, w));
             total_btns_w += w;
         }
@@ -236,13 +246,13 @@ impl MainState {
             total_btns_w += btn_gap * (btn_widths.len() as i32 - 1);
         }
 
-        let min_header_w = title_w + scale_px(10, s) + total_btns_w;
+        let min_header_w = title_w + scale_px(12, s) + total_btns_w;
         let content_w = table_w.max(min_header_w);
 
         let client_w = pad_x * 2 + content_w;
         let client_h = top_h + (cfg.targets.len() as i32) * row_h + pad_bottom;
 
-        let btn_top = scale_px(3, s);
+        let btn_top = scale_px(4, s);
         let btn_bot = top_h - scale_px(3, s);
         let mut right_cursor = client_w - pad_x;
         let mut buttons = Vec::with_capacity(btn_widths.len());
@@ -254,7 +264,8 @@ impl MainState {
                 bottom: btn_bot,
             };
             buttons.push(ButtonRect { kind, rect });
-            right_cursor -= w + btn_gap;
+            let extra = if kind == TopBtn::Minimize { ctrl_sep } else { 0 };
+            right_cursor -= w + btn_gap + extra;
         }
         buttons.reverse();
 
@@ -534,6 +545,8 @@ impl MainState {
                 self.config.ping_method.as_upper()
             ),
             TopBtn::Reset => "Reset Statistics".to_string(),
+            TopBtn::Minimize => "Minimize".to_string(),
+            TopBtn::Close => "Close".to_string(),
         }
     }
 
@@ -572,6 +585,12 @@ impl MainState {
             }
             TopBtn::Reset => {
                 self.reset_stats();
+            }
+            TopBtn::Minimize => {
+                ShowWindow(self.hwnd, SW_MINIMIZE);
+            }
+            TopBtn::Close => {
+                let _ = PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
             }
             TopBtn::Set | TopBtn::Update => {}
         }
@@ -629,6 +648,8 @@ impl MainState {
                 } else {
                     rgb(0x0e, 0x24, 0x32)
                 }
+            } else if btn.kind == TopBtn::Close && hovered {
+                rgb(0xc4, 0x2b, 0x1c)
             } else if hovered {
                 BG_BTN_HOVER
             } else {
@@ -692,6 +713,22 @@ impl MainState {
                         rgb(0xff, 0xff, 0xff)
                     } else {
                         rgb(0xff, 0xcc, 0x00)
+                    },
+                ),
+                TopBtn::Minimize => (
+                    "\u{2212}",
+                    if hovered {
+                        rgb(0xff, 0xff, 0xff)
+                    } else {
+                        rgb(0x88, 0x88, 0x88)
+                    },
+                ),
+                TopBtn::Close => (
+                    "\u{00D7}",
+                    if hovered {
+                        rgb(0xff, 0xff, 0xff)
+                    } else {
+                        rgb(0x99, 0x99, 0x99)
                     },
                 ),
             };
@@ -848,6 +885,10 @@ impl MainState {
         DeleteObject(box_brush as _);
         DeleteObject(box_pen as _);
 
+        let frame_brush = CreateSolidBrush(rgb(0x24, 0x24, 0x24));
+        FrameRect(mem_dc, &cr, frame_brush);
+        DeleteObject(frame_brush as _);
+
         BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
         SelectObject(mem_dc, old_bmp);
         DeleteObject(bmp as _);
@@ -882,6 +923,19 @@ unsafe extern "system" fn main_wnd_proc(
 
     match msg {
         WM_ERASEBKGND => 1,
+        WM_NCHITTEST => {
+            let mut pt = POINT {
+                x: (lparam & 0xFFFF) as i16 as i32,
+                y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+            };
+            ScreenToClient(hwnd, &mut pt);
+            if (*state_ptr).hit_test_button(pt.x, pt.y).is_some() {
+                HTCLIENT as LRESULT
+            } else {
+                HTCAPTION as LRESULT
+            }
+        }
+        WM_NCLBUTTONDBLCLK => 0,
         WM_PAINT => {
             (*state_ptr).paint();
             0
@@ -1137,7 +1191,7 @@ pub fn run() {
             return;
         }
 
-        enable_dark_title_bar(hwnd);
+        enable_borderless_frame(hwnd);
         apply_exe_icon(hwnd);
         apply_window_opacity(hwnd, config.opacity);
 
