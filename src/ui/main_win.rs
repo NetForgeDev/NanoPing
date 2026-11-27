@@ -861,13 +861,19 @@ impl MainState {
                 }
 
                 SelectObject(mem_dc, self.font_hist as _);
-                let (col, _) =
-                    row.cell_render_color(i, self.config.wave_speed, &self.config.colors, now);
+                let (col, slide) = row.cell_render_state(
+                    i,
+                    self.config.wave_style,
+                    self.config.wave_speed,
+                    &self.config.colors,
+                    now,
+                );
+                let x_off = -(slide * scale_px(4, self.scale) as f32).round() as i32;
                 SetTextColor(mem_dc, col);
                 let mut r_cell = RECT {
-                    left: x,
+                    left: x + x_off,
                     top: y_top,
-                    right: x + l.hist_cell_w,
+                    right: x + l.hist_cell_w + x_off,
                     bottom: y_bot,
                 };
                 let w_val = to_wide(&row.history[i].text);
@@ -949,14 +955,14 @@ unsafe extern "system" fn main_wnd_proc(
                     continue;
                 }
                 if let Some(row) = state.stats.rows.get_mut(ev.target_idx) {
-                    row.push(ev.result, state.config.wave_effect);
+                    row.push(ev.result, state.config.wave_style);
                     any_updated = true;
                 }
             }
             if any_updated {
                 let title = state.stats.build_window_title();
                 state.update_title(&title);
-                if state.config.wave_effect {
+                if state.config.wave_style.is_enabled() {
                     state.ensure_anim_timer();
                 }
                 InvalidateRect(hwnd, ptr::null(), 0);
@@ -1005,7 +1011,7 @@ unsafe extern "system" fn main_wnd_proc(
             if wparam == ANIM_TIMER_ID {
                 let active = state
                     .stats
-                    .has_active_animations(state.config.wave_speed, Instant::now());
+                    .has_active_animations(state.config.wave_style, state.config.wave_speed, Instant::now());
                 InvalidateRect(hwnd, ptr::null(), 0);
                 if !active {
                     state.stop_anim_timer();

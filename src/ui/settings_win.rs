@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
-use crate::config::{config_path, Config, PingColors, PingMethod, WaveSpeed};
+use crate::config::{config_path, Config, PingColors, PingMethod, WaveSpeed, WaveStyle};
 use crate::ui::about_win::show_about_dialog;
 use crate::ui::main_win::WM_APP_PREVIEW_CONFIG;
 use crate::ui::win_util::{
@@ -82,7 +82,7 @@ struct Draft {
     save_position: bool,
     autostart: bool,
     check_updates: bool,
-    wave_effect: bool,
+    wave_style: WaveStyle,
     wave_speed: WaveSpeed,
     font_size: String,
     opacity: String,
@@ -103,7 +103,7 @@ impl Draft {
             save_position: c.save_position,
             autostart: c.autostart,
             check_updates: c.check_updates,
-            wave_effect: c.wave_effect,
+            wave_style: c.wave_style,
             wave_speed: c.wave_speed,
             font_size: c.font_size.to_string(),
             opacity: c.opacity.to_string(),
@@ -219,7 +219,7 @@ impl SettingsState {
         cfg.save_position = self.draft.save_position;
         cfg.autostart = self.draft.autostart;
         cfg.check_updates = self.draft.check_updates;
-        cfg.wave_effect = self.draft.wave_effect;
+        cfg.wave_style = self.draft.wave_style;
         cfg.wave_speed = self.draft.wave_speed;
         cfg.colors = self.draft.colors;
 
@@ -486,7 +486,6 @@ impl SettingsState {
             ("Save Position:", self.draft.save_position, ID_SAVE_POS_BTN),
             ("Autostart:", self.draft.autostart, ID_AUTO_BTN),
             ("Auto Update:", self.draft.check_updates, ID_CHECK_UPD_BTN),
-            ("Wave Effect:", self.draft.wave_effect, ID_WAVE_BTN),
         ];
 
         for (label, on, id) in toggles {
@@ -514,6 +513,30 @@ impl SettingsState {
             );
             ry += item_step;
         }
+
+        add_ctrl(
+            &cls_static,
+            "Wave Style:",
+            SS_LEFT | SS_CENTERIMAGE,
+            right_col_x,
+            ry,
+            lbl_w,
+            item_h,
+            0,
+            self.font_regular,
+        );
+        add_ctrl(
+            &cls_btn,
+            self.draft.wave_style.as_upper(),
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+            right_col_x + col_w - ctrl_w,
+            ry,
+            ctrl_w,
+            item_h,
+            ID_WAVE_BTN,
+            self.font_bold,
+        );
+        ry += item_step;
 
         add_ctrl(
             &cls_static,
@@ -879,7 +902,11 @@ impl SettingsState {
             ID_SAVE_POS_BTN => toggle_style(self.draft.save_position),
             ID_AUTO_BTN => toggle_style(self.draft.autostart),
             ID_CHECK_UPD_BTN => toggle_style(self.draft.check_updates),
-            ID_WAVE_BTN => toggle_style(self.draft.wave_effect),
+            ID_WAVE_BTN => (
+                self.draft.wave_style.as_upper().to_string(),
+                rgb(0x22, 0x22, 0x22),
+                self.draft.wave_style.color(),
+            ),
             ID_SPEED_BTN => (
                 self.draft.wave_speed.as_upper().to_string(),
                 rgb(0x22, 0x22, 0x22),
@@ -1017,7 +1044,7 @@ impl SettingsState {
         cfg.save_position = self.draft.save_position;
         cfg.autostart = self.draft.autostart;
         cfg.check_updates = self.draft.check_updates;
-        cfg.wave_effect = self.draft.wave_effect;
+        cfg.wave_style = self.draft.wave_style;
         cfg.wave_speed = self.draft.wave_speed;
         cfg.font_size = font_size;
         cfg.opacity = opacity;
@@ -1122,7 +1149,7 @@ unsafe extern "system" fn settings_wnd_proc(
                         InvalidateRect(lparam as HWND, ptr::null(), 0);
                     }
                     ID_WAVE_BTN => {
-                        state.draft.wave_effect = !state.draft.wave_effect;
+                        state.draft.wave_style = state.draft.wave_style.next();
                         InvalidateRect(lparam as HWND, ptr::null(), 0);
                         state.emit_live_preview();
                     }

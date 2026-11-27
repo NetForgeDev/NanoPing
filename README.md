@@ -37,7 +37,7 @@ Engineered for minimal resource footprint (**~1.8 MB RAM**, **< 1 MB standalone 
 - **Customizable Dark HUD:**
   - Borderless pure-black HUD with Windows 11 rounded corners, minimal `−` / `×` header controls, full-window drag, and ClearType rendering.
   - Unified proportional font scaling (`9`–`28`) and customizable latency colors (`Low`, `Med`, `High`, `T/O`).
-  - Smooth 60 FPS wave fade animations with 4 speed profiles.
+  - Smooth 60 FPS wave animations (`Pulse`, `Fade`, `Slide`, `Off`) with cubic ease-out and 4 speed profiles.
 - **Live Preview Settings:** Changes inside Settings preview immediately on the main window and cleanly revert if closed without saving.
 - **Smart Multi-Monitor Persistence:** Saves window coordinates immediately after moving and automatically recovers onto a connected display if a monitor is disconnected.
 - **Automatic Self-Updater:** Silently checks GitHub Releases on launch, displays a compact `UPD` badge when a new version is available, and performs a clean one-click in-place update without touching `config.ini`.
@@ -70,7 +70,7 @@ Get-FileHash NanoPing.exe -Algorithm SHA256
 | `always_on_top` | Keep window pinned above other windows | `True` |
 | `save_position` | Save window position immediately when moved | `True` |
 | `autostart` | Launch automatically with Windows | `False` |
-| `wave_effect` | Enable wave fade animation on updates | `True` |
+| `wave_style` | Wave animation style (`off`, `pulse`, `fade`, `slide`) | `pulse` |
 | `wave_speed` | `normal`, `slow`, `fast`, or `very fast` | `normal` |
 | `font_size` | Unified proportional UI font size (`9`–`28`) | `14` |
 | `opacity` | Main window opacity percentage (`25`–`100`) | `100` |

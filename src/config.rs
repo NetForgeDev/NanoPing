@@ -14,6 +14,7 @@ const DEFAULT_HEADER: &str = "\
 ; Configuration File for NanoPing
 ; ping_method: icmp (Native Windows API), tcp (Port 443), or udp (DNS/QUIC/STUN/Port Probe)
 ; wave_speed: normal, slow, fast, very fast
+; wave_style: off, pulse, fade, slide
 
 ";
 
@@ -113,10 +114,69 @@ impl WaveSpeed {
 
     pub fn timing_ms(self) -> (u64, u64) {
         match self {
-            Self::Normal => (30, 90),
-            Self::Slow => (50, 140),
-            Self::Fast => (20, 65),
-            Self::VeryFast => (14, 45),
+            Self::Normal => (40, 180),
+            Self::Slow => (60, 260),
+            Self::Fast => (25, 120),
+            Self::VeryFast => (15, 75),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaveStyle {
+    Off,
+    Pulse,
+    Fade,
+    Slide,
+}
+
+impl WaveStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Pulse => "pulse",
+            Self::Fade => "fade",
+            Self::Slide => "slide",
+        }
+    }
+
+    pub fn as_upper(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Pulse => "PULSE",
+            Self::Fade => "FADE",
+            Self::Slide => "SLIDE",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" => Self::Off,
+            "fade" => Self::Fade,
+            "slide" => Self::Slide,
+            _ => Self::Pulse,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Pulse,
+            Self::Pulse => Self::Fade,
+            Self::Fade => Self::Slide,
+            Self::Slide => Self::Off,
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    pub fn color(self) -> u32 {
+        match self {
+            Self::Off => rgb(0xaa, 0xaa, 0xaa),
+            Self::Pulse => rgb(0x00, 0xdd, 0xff),
+            Self::Fade => rgb(0x00, 0xff, 0x66),
+            Self::Slide => rgb(0xcc, 0x77, 0xff),
         }
     }
 }
@@ -154,7 +214,7 @@ pub struct Config {
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
     pub autostart: bool,
-    pub wave_effect: bool,
+    pub wave_style: WaveStyle,
     pub wave_speed: WaveSpeed,
     pub font_size: u32,
     pub opacity: u8,
@@ -181,7 +241,7 @@ impl Default for Config {
             window_x: None,
             window_y: None,
             autostart: false,
-            wave_effect: true,
+            wave_style: WaveStyle::Pulse,
             wave_speed: WaveSpeed::Normal,
             font_size: 14,
             opacity: 100,
@@ -268,7 +328,7 @@ impl Config {
             "window_x",
             "window_y",
             "autostart",
-            "wave_effect",
+            "wave_style",
             "wave_speed",
             "font_size",
             "color_low",
@@ -365,10 +425,20 @@ impl Config {
                 .get("autostart")
                 .map(|v| parse_bool(v, defaults.autostart))
                 .unwrap_or(defaults.autostart),
-            wave_effect: map
-                .get("wave_effect")
-                .map(|v| parse_bool(v, defaults.wave_effect))
-                .unwrap_or(defaults.wave_effect),
+            wave_style: map
+                .get("wave_style")
+                .map(|v| WaveStyle::from_str(v))
+                .unwrap_or_else(|| {
+                    if let Some(legacy) = map.get("wave_effect") {
+                        if parse_bool(legacy, true) {
+                            WaveStyle::Pulse
+                        } else {
+                            WaveStyle::Off
+                        }
+                    } else {
+                        defaults.wave_style
+                    }
+                }),
             wave_speed: map
                 .get("wave_speed")
                 .map(|v| WaveSpeed::from_str(v))
@@ -420,7 +490,7 @@ save_position = {save_position}\n\
 window_x = {wx}\n\
 window_y = {wy}\n\
 autostart = {autostart}\n\
-wave_effect = {wave_effect}\n\
+wave_style = {wave_style}\n\
 wave_speed = {wave_speed}\n\
 font_size = {font_size}\n\
 opacity = {opacity}\n\
@@ -440,7 +510,7 @@ color_timeout = {color_timeout}\n",
             ping_method = self.ping_method.as_str(),
             save_position = fmt_bool(self.save_position),
             autostart = fmt_bool(self.autostart),
-            wave_effect = fmt_bool(self.wave_effect),
+            wave_style = self.wave_style.as_str(),
             wave_speed = self.wave_speed.as_str(),
             font_size = self.font_size,
             opacity = self.opacity,
