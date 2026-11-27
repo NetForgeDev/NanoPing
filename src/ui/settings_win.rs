@@ -56,6 +56,7 @@ const ID_COLOR_HIGH_BTN: u16 = 115;
 const ID_COLOR_TO_BTN: u16 = 116;
 const ID_OPACITY_DEC_BTN: u16 = 117;
 const ID_OPACITY_INC_BTN: u16 = 118;
+const ID_CHECK_UPD_BTN: u16 = 119;
 
 const ID_EDIT_HIST: u16 = 200;
 const ID_EDIT_LOSS: u16 = 201;
@@ -79,6 +80,7 @@ struct Draft {
     always_on_top: bool,
     save_position: bool,
     autostart: bool,
+    check_updates: bool,
     wave_effect: bool,
     wave_speed: WaveSpeed,
     font_size: String,
@@ -99,6 +101,7 @@ impl Draft {
             always_on_top: c.always_on_top,
             save_position: c.save_position,
             autostart: c.autostart,
+            check_updates: c.check_updates,
             wave_effect: c.wave_effect,
             wave_speed: c.wave_speed,
             font_size: c.font_size.to_string(),
@@ -214,6 +217,7 @@ impl SettingsState {
         cfg.always_on_top = self.draft.always_on_top;
         cfg.save_position = self.draft.save_position;
         cfg.autostart = self.draft.autostart;
+        cfg.check_updates = self.draft.check_updates;
         cfg.wave_effect = self.draft.wave_effect;
         cfg.wave_speed = self.draft.wave_speed;
         cfg.colors = self.draft.colors;
@@ -277,9 +281,10 @@ impl SettingsState {
         let hinst = GetModuleHandleW(ptr::null());
 
         let pad = px(12);
-        let col_w = px(136);
-        let col_gap = px(10);
+        let col_w = px(200);
+        let col_gap = px(16);
         let client_w = pad * 2 + col_w * 2 + col_gap;
+        let content_w = client_w - pad * 2;
         let mut y = px(10);
 
         let cls_static = to_wide("STATIC");
@@ -316,42 +321,57 @@ impl SettingsState {
             ch
         };
 
-        // Section: Target Addresses + About button
-        let about_w = px(64);
+        // Header: Targets + [+ Add] + [ABOUT]
+        let top_btn_w = px(58);
+        let top_gap = px(5);
         add_ctrl(
             &cls_static,
             "Target Addresses:",
             SS_LEFT | SS_CENTERIMAGE,
             pad,
             y,
-            client_w - pad * 2 - about_w - px(6),
+            content_w - top_btn_w * 2 - top_gap * 2,
             px(20),
             0,
             self.font_bold,
         );
         add_ctrl(
             &cls_btn,
+            "+ Add",
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+            client_w - pad - top_btn_w * 2 - top_gap,
+            y,
+            top_btn_w,
+            px(20),
+            ID_ADD_TARGET,
+            self.font_bold,
+        );
+        add_ctrl(
+            &cls_btn,
             "ABOUT",
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            client_w - pad - about_w,
+            client_w - pad - top_btn_w,
             y,
-            about_w,
+            top_btn_w,
             px(20),
             ID_ABOUT_BTN,
             self.font_bold,
         );
-        y += px(26);
+        y += px(25);
 
-        let del_w = px(22);
-        let ent_w = col_w - del_w - px(4);
-        let row_h = px(22);
+        // 3-column Targets grid
+        let t_gap = px(6);
+        let t_col_w = (content_w - t_gap * 2) / 3;
+        let del_w = px(20);
+        let ent_w = t_col_w - del_w - px(2);
+        let row_h = px(21);
 
         let targets_snapshot = self.draft.targets.clone();
         for (idx, val) in targets_snapshot.iter().enumerate() {
-            let r = (idx / 2) as i32;
-            let c = (idx % 2) as i32;
-            let rx = pad + c * (col_w + col_gap);
-            let ry = y + r * (row_h + px(5));
+            let r = (idx / 3) as i32;
+            let c = (idx % 3) as i32;
+            let rx = pad + c * (t_col_w + t_gap);
+            let ry = y + r * (row_h + px(4));
 
             let eh = add_ctrl(
                 &cls_edit,
@@ -370,7 +390,7 @@ impl SettingsState {
                 &cls_btn,
                 "X",
                 WS_TABSTOP | BS_OWNERDRAW as u32,
-                rx + ent_w + px(4),
+                rx + ent_w + px(2),
                 ry,
                 del_w,
                 row_h,
@@ -379,35 +399,25 @@ impl SettingsState {
             );
         }
 
-        let target_rows = ((targets_snapshot.len() + 1) / 2).max(1) as i32;
-        y += target_rows * (row_h + px(5)) + px(4);
+        let target_rows = ((targets_snapshot.len() + 2) / 3).max(1) as i32;
+        y += target_rows * (row_h + px(4)) + px(8);
 
-        add_ctrl(
-            &cls_btn,
-            "+ Add Target",
-            WS_TABSTOP | BS_OWNERDRAW as u32,
-            pad,
-            y,
-            client_w - pad * 2,
-            px(24),
-            ID_ADD_TARGET,
-            self.font_bold,
-        );
-        y += px(32);
+        // 2-column settings grid
+        let left_x = pad;
+        let right_col_x = pad + col_w + col_gap;
+        let ctrl_w = px(72);
+        let lbl_w = col_w - ctrl_w - px(4);
+        let item_h = px(21);
+        let item_step = px(26);
 
-        let right_w = px(84);
-        let right_x = client_w - pad - right_w;
-        let lbl_w = right_x - pad - px(6);
-        let item_h = px(22);
-        let item_step = px(28);
-
-        // Ping Method
+        // Left column: Ping Method + 5 numeric settings
+        let mut ly = y;
         add_ctrl(
             &cls_static,
             "Ping Method:",
             SS_LEFT | SS_CENTERIMAGE,
-            pad,
-            y,
+            left_x,
+            ly,
             lbl_w,
             item_h,
             0,
@@ -417,21 +427,20 @@ impl SettingsState {
             &cls_btn,
             self.draft.method.as_upper(),
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            right_x,
-            y,
-            right_w,
+            left_x + col_w - ctrl_w,
+            ly,
+            ctrl_w,
             item_h,
             ID_METHOD_BTN,
             self.font_bold,
         );
-        y += item_step;
+        ly += item_step;
 
-        // Numeric rows
         let numeric_rows = [
             ("History Count:", self.draft.hist.clone(), ID_EDIT_HIST),
-            ("Loss Window Size:", self.draft.loss.clone(), ID_EDIT_LOSS),
-            ("Average Window Size:", self.draft.avg.clone(), ID_EDIT_AVG),
-            ("Refresh Interval (ms):", self.draft.refresh.clone(), ID_EDIT_REF),
+            ("Loss Window:", self.draft.loss.clone(), ID_EDIT_LOSS),
+            ("Avg Window:", self.draft.avg.clone(), ID_EDIT_AVG),
+            ("Interval (ms):", self.draft.refresh.clone(), ID_EDIT_REF),
             ("Timeout (ms):", self.draft.timeout.clone(), ID_EDIT_TIMEOUT),
         ];
 
@@ -440,8 +449,8 @@ impl SettingsState {
                 &cls_static,
                 label,
                 SS_LEFT | SS_CENTERIMAGE,
-                pad,
-                y,
+                left_x,
+                ly,
                 lbl_w,
                 item_h,
                 0,
@@ -451,9 +460,9 @@ impl SettingsState {
                 &cls_edit,
                 &val,
                 WS_TABSTOP | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL,
-                right_x,
-                y,
-                right_w,
+                left_x + col_w - ctrl_w,
+                ly,
+                ctrl_w,
                 item_h,
                 id,
                 self.font_regular,
@@ -466,15 +475,17 @@ impl SettingsState {
                 ID_EDIT_TIMEOUT => self.edit_timeout = h,
                 _ => {}
             }
-            y += item_step;
+            ly += item_step;
         }
 
-        // Toggle rows
+        // Right column: 5 toggles + Wave Speed
+        let mut ry = y;
         let toggles = [
             ("Always on Top:", self.draft.always_on_top, ID_TOP_BTN),
-            ("Save Window Position:", self.draft.save_position, ID_SAVE_POS_BTN),
-            ("Start with Windows:", self.draft.autostart, ID_AUTO_BTN),
-            ("Wave Fade Effect:", self.draft.wave_effect, ID_WAVE_BTN),
+            ("Save Position:", self.draft.save_position, ID_SAVE_POS_BTN),
+            ("Autostart:", self.draft.autostart, ID_AUTO_BTN),
+            ("Auto Update:", self.draft.check_updates, ID_CHECK_UPD_BTN),
+            ("Wave Effect:", self.draft.wave_effect, ID_WAVE_BTN),
         ];
 
         for (label, on, id) in toggles {
@@ -482,8 +493,8 @@ impl SettingsState {
                 &cls_static,
                 label,
                 SS_LEFT | SS_CENTERIMAGE,
-                pad,
-                y,
+                right_col_x,
+                ry,
                 lbl_w,
                 item_h,
                 0,
@@ -493,23 +504,22 @@ impl SettingsState {
                 &cls_btn,
                 if on { "ON" } else { "OFF" },
                 WS_TABSTOP | BS_OWNERDRAW as u32,
-                right_x,
-                y,
-                right_w,
+                right_col_x + col_w - ctrl_w,
+                ry,
+                ctrl_w,
                 item_h,
                 id,
                 self.font_bold,
             );
-            y += item_step;
+            ry += item_step;
         }
 
-        // Wave Effect Speed
         add_ctrl(
             &cls_static,
-            "Wave Effect Speed:",
+            "Wave Speed:",
             SS_LEFT | SS_CENTERIMAGE,
-            pad,
-            y,
+            right_col_x,
+            ry,
             lbl_w,
             item_h,
             0,
@@ -519,35 +529,40 @@ impl SettingsState {
             &cls_btn,
             self.draft.wave_speed.as_upper(),
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            right_x,
-            y,
-            right_w,
+            right_col_x + col_w - ctrl_w,
+            ry,
+            ctrl_w,
             item_h,
             ID_SPEED_BTN,
             self.font_bold,
         );
-        y += item_step;
 
-        // Font Size stepper: [-] [14] [+]
+        y = ly.max(ry + item_step) + px(4);
+
+        // Paired steppers row: Font (left) + Opacity (right)
+        let step_btn_w = px(20);
+        let step_gap = px(2);
+        let step_ctrl_w = px(76);
+        let step_edit_w = step_ctrl_w - step_btn_w * 2 - step_gap * 2;
+        let step_lbl_w = col_w - step_ctrl_w - px(4);
+
+        let lx_ctrl = left_x + col_w - step_ctrl_w;
         add_ctrl(
             &cls_static,
-            "Font Size (9-28):",
+            "Font (9-28):",
             SS_LEFT | SS_CENTERIMAGE,
-            pad,
+            left_x,
             y,
-            lbl_w,
+            step_lbl_w,
             item_h,
             0,
             self.font_regular,
         );
-        let step_btn_w = px(22);
-        let step_gap = px(3);
-        let step_edit_w = right_w - step_btn_w * 2 - step_gap * 2;
         add_ctrl(
             &cls_btn,
             "-",
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            right_x,
+            lx_ctrl,
             y,
             step_btn_w,
             item_h,
@@ -558,7 +573,7 @@ impl SettingsState {
             &cls_edit,
             &self.draft.font_size.clone(),
             WS_TABSTOP | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL,
-            right_x + step_btn_w + step_gap,
+            lx_ctrl + step_btn_w + step_gap,
             y,
             step_edit_w,
             item_h,
@@ -569,23 +584,22 @@ impl SettingsState {
             &cls_btn,
             "+",
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            right_x + step_btn_w + step_gap + step_edit_w + step_gap,
+            lx_ctrl + step_btn_w + step_gap + step_edit_w + step_gap,
             y,
             step_btn_w,
             item_h,
             ID_FONT_INC_BTN,
             self.font_bold,
         );
-        y += item_step;
 
-        // Opacity stepper: [-] [100] [+]
+        let rx_ctrl = right_col_x + col_w - step_ctrl_w;
         add_ctrl(
             &cls_static,
-            "Opacity % (25-100):",
+            "Opacity (%):",
             SS_LEFT | SS_CENTERIMAGE,
-            pad,
+            right_col_x,
             y,
-            lbl_w,
+            step_lbl_w,
             item_h,
             0,
             self.font_regular,
@@ -594,7 +608,7 @@ impl SettingsState {
             &cls_btn,
             "-",
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            right_x,
+            rx_ctrl,
             y,
             step_btn_w,
             item_h,
@@ -605,7 +619,7 @@ impl SettingsState {
             &cls_edit,
             &self.draft.opacity.clone(),
             WS_TABSTOP | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL,
-            right_x + step_btn_w + step_gap,
+            rx_ctrl + step_btn_w + step_gap,
             y,
             step_edit_w,
             item_h,
@@ -616,32 +630,31 @@ impl SettingsState {
             &cls_btn,
             "+",
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            right_x + step_btn_w + step_gap + step_edit_w + step_gap,
+            rx_ctrl + step_btn_w + step_gap + step_edit_w + step_gap,
             y,
             step_btn_w,
             item_h,
             ID_OPACITY_INC_BTN,
             self.font_bold,
         );
-        y += item_step + px(2);
+        y += item_step + px(4);
 
-        // Ping Colors (4 sleek swatch pills)
+        // Inline Ping Colors row
+        let cl_w = px(54);
+        let c_gap = px(6);
+        let c_w = (content_w - cl_w - c_gap * 3) / 4;
+        let c_h = px(22);
         add_ctrl(
             &cls_static,
-            "Ping Colors:",
+            "Colors:",
             SS_LEFT | SS_CENTERIMAGE,
             pad,
             y,
-            client_w - pad * 2,
-            px(18),
+            cl_w,
+            c_h,
             0,
             self.font_bold,
         );
-        y += px(22);
-
-        let c_gap = px(6);
-        let c_w = (client_w - pad * 2 - c_gap * 3) / 4;
-        let c_h = px(24);
         let color_btns = [
             ("Low", ID_COLOR_LOW_BTN),
             ("Med", ID_COLOR_MED_BTN),
@@ -649,7 +662,7 @@ impl SettingsState {
             ("T/O", ID_COLOR_TO_BTN),
         ];
         for (i, (label, id)) in color_btns.iter().enumerate() {
-            let cx = pad + (i as i32) * (c_w + c_gap);
+            let cx = pad + cl_w + (i as i32) * (c_w + c_gap);
             add_ctrl(
                 &cls_btn,
                 label,
@@ -662,12 +675,12 @@ impl SettingsState {
                 self.font_bold,
             );
         }
-        y += c_h + px(14);
+        y += c_h + px(12);
 
         // Bottom 3 buttons: DEFAULTS | OPEN INI | SAVE
-        let b_gap = px(6);
-        let b_w = (client_w - pad * 2 - b_gap * 2) / 3;
-        let b_h = px(26);
+        let b_gap = px(8);
+        let b_w = (content_w - b_gap * 2) / 3;
+        let b_h = px(25);
         add_ctrl(
             &cls_btn,
             "DEFAULTS",
@@ -852,7 +865,7 @@ impl SettingsState {
                 rgb(0x00, 0xcc, 0xff),
             ),
             ID_ADD_TARGET => (
-                "+ Add Target".to_string(),
+                "+ Add".to_string(),
                 rgb(0x1c, 0x1c, 0x1c),
                 rgb(0x00, 0xff, 0x66),
             ),
@@ -864,6 +877,7 @@ impl SettingsState {
             ID_TOP_BTN => toggle_style(self.draft.always_on_top),
             ID_SAVE_POS_BTN => toggle_style(self.draft.save_position),
             ID_AUTO_BTN => toggle_style(self.draft.autostart),
+            ID_CHECK_UPD_BTN => toggle_style(self.draft.check_updates),
             ID_WAVE_BTN => toggle_style(self.draft.wave_effect),
             ID_SPEED_BTN => (
                 self.draft.wave_speed.as_upper().to_string(),
@@ -1001,6 +1015,7 @@ impl SettingsState {
         cfg.always_on_top = self.draft.always_on_top;
         cfg.save_position = self.draft.save_position;
         cfg.autostart = self.draft.autostart;
+        cfg.check_updates = self.draft.check_updates;
         cfg.wave_effect = self.draft.wave_effect;
         cfg.wave_speed = self.draft.wave_speed;
         cfg.font_size = font_size;
@@ -1097,6 +1112,10 @@ unsafe extern "system" fn settings_wnd_proc(
                     }
                     ID_AUTO_BTN => {
                         state.draft.autostart = !state.draft.autostart;
+                        InvalidateRect(lparam as HWND, ptr::null(), 0);
+                    }
+                    ID_CHECK_UPD_BTN => {
+                        state.draft.check_updates = !state.draft.check_updates;
                         InvalidateRect(lparam as HWND, ptr::null(), 0);
                     }
                     ID_WAVE_BTN => {

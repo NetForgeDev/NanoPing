@@ -83,6 +83,26 @@ pub fn enable_dark_title_bar(hwnd: HWND) {
     }
 }
 
+pub fn enable_borderless_frame(hwnd: HWND) {
+    enable_dark_title_bar(hwnd);
+    unsafe {
+        let corner_pref: i32 = 3; // DWMWCP_ROUNDSMALL (Windows 11)
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            33, // DWMWA_WINDOW_CORNER_PREFERENCE
+            &corner_pref as *const i32 as *const c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        let border_color: u32 = rgb(0x28, 0x28, 0x28);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            34, // DWMWA_BORDER_COLOR
+            &border_color as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
 pub fn apply_exe_icon(hwnd: HWND) {
     if let Ok(exe) = std::env::current_exe() {
         let wide = to_wide(&exe.to_string_lossy());

@@ -35,7 +35,7 @@ Engineered for minimal resource footprint (**~1.8 MB RAM**, **< 1 MB standalone 
   - **UDP:** Multi-protocol probe (DNS `53`, RFC 9000 QUIC `443`, STUN `3478`, and Port Unreachable `33434`).
 - **Real-Time Statistics:** Sliding-window packet loss (`L:0%`), rolling average (`A:42ms`), and live taskbar title updates.
 - **Customizable Dark HUD:**
-  - Pure black compact UI with Windows dark title bar and ClearType rendering.
+  - Borderless pure-black HUD with Windows 11 rounded corners, minimal `−` / `×` header controls, full-window drag, and ClearType rendering.
   - Unified proportional font scaling (`9`–`28`) and customizable latency colors (`Low`, `Med`, `High`, `T/O`).
   - Smooth 60 FPS wave fade animations with 4 speed profiles.
 - **Live Preview Settings:** Changes inside Settings preview immediately on the main window and cleanly revert if closed without saving.
@@ -74,6 +74,7 @@ Get-FileHash NanoPing.exe -Algorithm SHA256
 | `wave_speed` | `normal`, `slow`, `fast`, or `very fast` | `normal` |
 | `font_size` | Unified proportional UI font size (`9`–`28`) | `14` |
 | `opacity` | Main window opacity percentage (`25`–`100`) | `100` |
+| `check_updates` | Silently check for GitHub updates on startup | `True` |
 | `color_low` | Hex color for latency `< 100ms` | `#00cc55` |
 | `color_medium` | Hex color for latency `100–200ms` | `#e6e600` |
 | `color_high` | Hex color for latency `> 200ms` | `#e68a00` |
