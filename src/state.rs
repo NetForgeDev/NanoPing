@@ -210,15 +210,23 @@ impl AppStats {
             .rows
             .iter()
             .map(|r| {
-                let avg = r.avg_ms();
-                let loss = r.loss_pct() as u32;
-                if loss > 0 {
-                    format!("{avg}ms (L:{loss}%)")
+                let loss = r.loss_pct().round() as u32;
+                let val = if r.avg_window.is_empty() {
+                    if r.loss_window.is_empty() {
+                        "...".to_string()
+                    } else {
+                        "T/O".to_string()
+                    }
                 } else {
-                    format!("{avg}ms")
+                    r.avg_ms().to_string()
+                };
+                if loss > 0 {
+                    format!("{val} (L:{loss})")
+                } else {
+                    val
                 }
             })
             .collect();
-        parts.join(" | ")
+        format!("NanoPing \u{00B7} {}", parts.join(" | "))
     }
 }
