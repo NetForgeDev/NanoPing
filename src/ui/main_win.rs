@@ -26,17 +26,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IDC_HAND, IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MSG, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY,
     WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST,
-    WM_NCLBUTTONDBLCLK, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
+    WM_NCLBUTTONDBLCLK, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
     WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
 };
 
-use crate::config::{set_autostart, Config};
+use crate::config::{set_autostart, Config, PingMethod, TargetKind};
 use crate::ping::{PingEngine, PingEvent};
 use crate::state::AppStats;
 use crate::ui::settings_win::show_settings_dialog;
 use crate::ui::tooltip::DarkTooltip;
 use crate::ui::win_util::{
-    apply_exe_icon, apply_window_opacity, enable_borderless_frame, get_dpi_scale, method_color,
+    apply_exe_icon, apply_window_opacity, enable_borderless_frame, get_dpi_scale, lerp_color, method_color,
     resolve_safe_window_position, rgb, scale_px, to_wide, APP_NAME, APP_VERSION, BG_BOX, BG_BTN,
     BG_BTN_HOVER, BG_MAIN,
 };
@@ -73,6 +73,12 @@ struct ButtonRect {
     rect: RECT,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoverItem {
+    Top(TopBtn),
+    RowMethod(usize),
+}
+
 enum MainUpdateEvent {
     Available(UpdateInfo),
     InstallDone(Result<(), String>),
@@ -84,6 +90,9 @@ struct Layout {
     pad_x: i32,
     top_h: i32,
     row_h: i32,
+    show_kind: bool,
+    kind_w: i32,
+    method_w: i32,
     ip_w: i32,
     loss_w: i32,
     avg_w: i32,
@@ -91,6 +100,7 @@ struct Layout {
     sep_w: i32,
     gap: i32,
     buttons: Vec<ButtonRect>,
+    row_method_rects: Vec<RECT>,
 }
 
 struct MainState {
@@ -110,7 +120,7 @@ struct MainState {
     font_hist: HFONT,
     font_sep: HFONT,
     layout: Layout,
-    hovered_btn: Option<TopBtn>,
+    hovered: Option<HoverItem>,
     tracking_mouse: bool,
     anim_timer_active: bool,
     tooltip: DarkTooltip,
@@ -195,16 +205,23 @@ impl MainState {
         let row_h = scale_px(21, s);
         let gap = scale_px(4, s);
 
+        let show_kind = cfg.has_proxy_targets();
+        let kind_w = if show_kind {
+            Self::measure_char_width(hwnd, font_ui, "S5") + scale_px(4, s)
+        } else {
+            0
+        };
         let max_ip_chars = cfg
             .targets
             .iter()
-            .map(|t| t.len())
+            .map(|t| t.display_label().len())
             .max()
             .unwrap_or(8)
             .max(8);
         let sample_ip = "8".repeat(max_ip_chars);
         let ip_w = Self::measure_char_width(hwnd, font_mono, &sample_ip) + scale_px(2, s);
-        let loss_w = Self::measure_char_width(hwnd, font_mono, "L:99%") + scale_px(6, s);
+        let method_w = Self::measure_char_width(hwnd, font_ui, "U") + scale_px(8, s);
+        let loss_w = Self::measure_char_width(hwnd, font_mono, "L:100%") + scale_px(6, s);
         let avg_w = Self::measure_char_width(hwnd, font_mono, "A:999ms") + scale_px(6, s);
         let hist_cell_w = Self::measure_char_width(hwnd, font_hist, "999ms") + scale_px(2, s);
         let sep_w = scale_px(5, s);
@@ -216,7 +233,9 @@ impl MainState {
                 + ((cfg.history_count - 1) as i32) * sep_w
         };
 
-        let table_w = ip_w + gap + loss_w + gap + avg_w + gap + hist_total_w;
+        let kind_part = if show_kind { kind_w + scale_px(3, s) } else { 0 };
+        let table_w =
+            kind_part + ip_w + scale_px(3, s) + method_w + gap + loss_w + gap + avg_w + gap + hist_total_w;
 
         let title_w = Self::measure_char_width(hwnd, font_ui, "NANOPING (ICMP)");
         let btn_pad_x = scale_px(5, s);
@@ -272,12 +291,28 @@ impl MainState {
         }
         buttons.reverse();
 
+        let method_x = pad_x + kind_part + ip_w + scale_px(3, s);
+        let m_pad_y = scale_px(2, s);
+        let mut row_method_rects = Vec::with_capacity(cfg.targets.len());
+        for idx in 0..cfg.targets.len() {
+            let y_top = top_h + (idx as i32) * row_h;
+            row_method_rects.push(RECT {
+                left: method_x,
+                top: y_top + m_pad_y,
+                right: method_x + method_w,
+                bottom: y_top + row_h - m_pad_y,
+            });
+        }
+
         Layout {
             client_w,
             client_h,
             pad_x,
             top_h,
             row_h,
+            show_kind,
+            kind_w,
+            method_w,
             ip_w,
             loss_w,
             avg_w,
@@ -285,6 +320,7 @@ impl MainState {
             sep_w,
             gap,
             buttons,
+            row_method_rects,
         }
     }
 
@@ -389,7 +425,7 @@ impl MainState {
     }
 
     unsafe fn start_or_restart_pingers(&mut self) {
-        self.engine.bump_reset_cycle();
+        self.engine.bump_all_cycles();
         self.engine.set_method(self.config.ping_method);
         self.stats = AppStats::from_config(&self.config);
 
@@ -400,6 +436,7 @@ impl MainState {
         self.engine.start_workers(
             self.hwnd,
             &self.config.targets,
+            &self.config.proxy_probe_host,
             self.config.refresh_interval_ms,
             self.config.timeout_ms,
             self.tx.clone(),
@@ -416,6 +453,7 @@ impl MainState {
         }
 
         let needs_rebuild = new_cfg.targets != self.config.targets
+            || new_cfg.proxy_probe_host != self.config.proxy_probe_host
             || new_cfg.history_count != self.config.history_count
             || new_cfg.ping_method != self.config.ping_method
             || new_cfg.refresh_interval_ms != self.config.refresh_interval_ms
@@ -492,7 +530,7 @@ impl MainState {
     }
 
     unsafe fn reset_stats(&mut self) {
-        self.engine.bump_reset_cycle();
+        self.engine.bump_all_cycles();
         self.stats.reset();
         self.update_title(APP_NAME);
         InvalidateRect(self.hwnd, ptr::null(), 0);
@@ -516,9 +554,9 @@ impl MainState {
             self.anim_timer_active = false;
         }
     }
-    fn tooltip_text(&self, kind: TopBtn) -> String {
-        match kind {
-            TopBtn::Update => {
+    fn tooltip_text(&self, item: HoverItem) -> String {
+        match item {
+            HoverItem::Top(TopBtn::Update) => {
                 if self.updating {
                     "Downloading & installing update...".to_string()
                 } else if let Some(ref info) = self.available_update {
@@ -532,21 +570,40 @@ impl MainState {
                     "Update Available".to_string()
                 }
             }
-            TopBtn::Set => "Settings".to_string(),
-            TopBtn::Pin => {
+            HoverItem::Top(TopBtn::Set) => "Settings".to_string(),
+            HoverItem::Top(TopBtn::Pin) => {
                 if self.config.always_on_top {
                     "Always on Top: ON".to_string()
                 } else {
                     "Always on Top: OFF".to_string()
                 }
             }
-            TopBtn::Method => format!(
-                "Ping Method: {} (Click to switch)",
+            HoverItem::Top(TopBtn::Method) => format!(
+                "Global Method: {} (L-Click: switch, R-Click: reset all to AUTO)",
                 self.config.ping_method.as_upper()
             ),
-            TopBtn::Reset => "Reset Statistics".to_string(),
-            TopBtn::Minimize => "Minimize".to_string(),
-            TopBtn::Close => "Close".to_string(),
+            HoverItem::Top(TopBtn::Reset) => "Reset Statistics".to_string(),
+            HoverItem::Top(TopBtn::Minimize) => "Minimize".to_string(),
+            HoverItem::Top(TopBtn::Close) => "Close".to_string(),
+            HoverItem::RowMethod(idx) => {
+                if let Some(t) = self.config.targets.get(idx) {
+                    let kind_str = match t.kind {
+                        TargetKind::Direct => "Direct",
+                        TargetKind::Socks5 => "SOCKS5 Proxy",
+                        TargetKind::Http => "HTTP Proxy",
+                    };
+                    let eff = t.effective_method(self.config.ping_method).as_upper();
+                    if t.kind == TargetKind::Http {
+                        format!("{kind_str} \u{00B7} TCP only")
+                    } else if t.is_overridden() {
+                        format!("{kind_str} \u{00B7} {eff} (Locked — L-Click: switch, R-Click: Auto)")
+                    } else {
+                        format!("{kind_str} \u{00B7} {eff} (Auto — L-Click: lock/switch)")
+                    }
+                } else {
+                    String::new()
+                }
+            }
         }
     }
 
@@ -555,13 +612,30 @@ impl MainState {
         self.tooltip.hide();
     }
 
-    fn hit_test_button(&self, x: i32, y: i32) -> Option<TopBtn> {
+    fn hit_test(&self, x: i32, y: i32) -> Option<HoverItem> {
         for b in &self.layout.buttons {
             if x >= b.rect.left && x <= b.rect.right && y >= b.rect.top && y <= b.rect.bottom {
-                return Some(b.kind);
+                return Some(HoverItem::Top(b.kind));
+            }
+        }
+        for (idx, r) in self.layout.row_method_rects.iter().enumerate() {
+            if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom {
+                return Some(HoverItem::RowMethod(idx));
             }
         }
         None
+    }
+
+    fn item_rect(&self, item: HoverItem) -> Option<RECT> {
+        match item {
+            HoverItem::Top(kind) => self
+                .layout
+                .buttons
+                .iter()
+                .find(|b| b.kind == kind)
+                .map(|b| b.rect),
+            HoverItem::RowMethod(idx) => self.layout.row_method_rects.get(idx).copied(),
+        }
     }
 
     unsafe fn handle_quick_button(&mut self, kind: TopBtn) {
@@ -578,10 +652,23 @@ impl MainState {
                 InvalidateRect(self.hwnd, ptr::null(), 0);
             }
             TopBtn::Method => {
-                self.config.ping_method = self.config.ping_method.next();
-                self.engine.set_method(self.config.ping_method);
+                let old_global = self.config.ping_method;
+                let new_global = old_global.next();
+                self.config.ping_method = new_global;
+                self.engine.set_method(new_global);
                 self.config.save();
-                self.reset_stats();
+
+                for (idx, t) in self.config.targets.iter().enumerate() {
+                    if t.effective_method(old_global) != t.effective_method(new_global) {
+                        self.engine.bump_target_cycle(idx);
+                        if let Some(row) = self.stats.rows.get_mut(idx) {
+                            row.reset();
+                        }
+                    }
+                }
+                let title = self.stats.build_window_title();
+                self.update_title(&title);
+                InvalidateRect(self.hwnd, ptr::null(), 0);
             }
             TopBtn::Reset => {
                 self.reset_stats();
@@ -641,7 +728,7 @@ impl MainState {
         let pen_btn_border = CreatePen(PS_SOLID as i32, 1, rgb(0x22, 0x22, 0x22));
         let pen_upd_border = CreatePen(PS_SOLID as i32, 1, rgb(0x00, 0x88, 0xaa));
         for btn in &l.buttons {
-            let hovered = self.hovered_btn == Some(btn.kind);
+            let hovered = self.hovered == Some(HoverItem::Top(btn.kind));
             let fill_col = if btn.kind == TopBtn::Update {
                 if hovered {
                     rgb(0x18, 0x3a, 0x4e)
@@ -756,6 +843,31 @@ impl MainState {
             let y_bot = y_top + l.row_h;
             let mut x = l.pad_x;
 
+            if l.show_kind {
+                SelectObject(mem_dc, self.font_ui as _);
+                let kind_col = if row.target.kind == TargetKind::Direct {
+                    rgb(0x55, 0x55, 0x55)
+                } else {
+                    row.target.kind.color()
+                };
+                SetTextColor(mem_dc, kind_col);
+                let mut r_kind = RECT {
+                    left: x,
+                    top: y_top,
+                    right: x + l.kind_w,
+                    bottom: y_bot,
+                };
+                let w_kind = to_wide(row.target.kind.as_badge());
+                DrawTextW(
+                    mem_dc,
+                    w_kind.as_ptr(),
+                    -1,
+                    &mut r_kind,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+                x += l.kind_w + scale_px(3, self.scale);
+            }
+
             SelectObject(mem_dc, self.font_mono as _);
             SetTextColor(mem_dc, rgb(0xff, 0xff, 0xff));
             let mut r_ip = RECT {
@@ -764,7 +876,7 @@ impl MainState {
                 right: x + l.ip_w,
                 bottom: y_bot,
             };
-            let w_ip = to_wide(&row.target);
+            let w_ip = to_wide(row.target.display_label());
             DrawTextW(
                 mem_dc,
                 w_ip.as_ptr(),
@@ -772,7 +884,62 @@ impl MainState {
                 &mut r_ip,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
-            x += l.ip_w + l.gap;
+            x += l.ip_w + scale_px(3, self.scale);
+
+            // Compact clickable per-row method badge (I / T / U)
+            let eff_m = row.target.effective_method(self.config.ping_method);
+            let m_letter = match eff_m {
+                PingMethod::Icmp => "I",
+                PingMethod::Tcp => "T",
+                PingMethod::Udp => "U",
+            };
+            let m_hovered = self.hovered == Some(HoverItem::RowMethod(row_idx));
+            let m_overridden = row.target.is_overridden();
+            let mut r_m = l
+                .row_method_rects
+                .get(row_idx)
+                .copied()
+                .unwrap_or(RECT {
+                    left: x,
+                    top: y_top + box_pad_y,
+                    right: x + l.method_w,
+                    bottom: y_bot - box_pad_y,
+                });
+            if m_hovered || m_overridden {
+                let m_fill = CreateSolidBrush(if m_hovered { BG_BTN_HOVER } else { BG_BOX });
+                let m_pen = CreatePen(
+                    PS_SOLID as i32,
+                    1,
+                    if m_overridden { rgb(0x30, 0x30, 0x30) } else { rgb(0x22, 0x22, 0x22) },
+                );
+                let ob = SelectObject(mem_dc, m_fill as _);
+                let op = SelectObject(mem_dc, m_pen as _);
+                RoundRect(
+                    mem_dc,
+                    r_m.left,
+                    r_m.top,
+                    r_m.right,
+                    r_m.bottom,
+                    corner,
+                    corner,
+                );
+                SelectObject(mem_dc, ob);
+                SelectObject(mem_dc, op);
+                DeleteObject(m_fill as _);
+                DeleteObject(m_pen as _);
+            }
+            SelectObject(mem_dc, self.font_ui as _);
+            SetTextColor(mem_dc, method_color(eff_m));
+            let w_m = to_wide(m_letter);
+            DrawTextW(
+                mem_dc,
+                w_m.as_ptr(),
+                -1,
+                &mut r_m,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            x = r_m.right + l.gap;
+            SelectObject(mem_dc, self.font_mono as _);
 
             // Loss box
             let mut r_loss = RECT {
@@ -861,7 +1028,7 @@ impl MainState {
                 }
 
                 SelectObject(mem_dc, self.font_hist as _);
-                let (col, slide) = row.cell_render_state(
+                let (col, slide, glow) = row.cell_render_state(
                     i,
                     self.config.wave_style,
                     self.config.wave_speed,
@@ -869,13 +1036,33 @@ impl MainState {
                     now,
                 );
                 let x_off = -(slide * scale_px(4, self.scale) as f32).round() as i32;
-                SetTextColor(mem_dc, col);
                 let mut r_cell = RECT {
                     left: x + x_off,
                     top: y_top,
                     right: x + l.hist_cell_w + x_off,
                     bottom: y_bot,
                 };
+                if glow > 0.02 {
+                    let aura_col = lerp_color(BG_MAIN, col, glow * 0.24);
+                    let aura_brush = CreateSolidBrush(aura_col);
+                    let aura_pen = CreatePen(PS_SOLID as i32, 1, aura_col);
+                    let ob = SelectObject(mem_dc, aura_brush as _);
+                    let op = SelectObject(mem_dc, aura_pen as _);
+                    RoundRect(
+                        mem_dc,
+                        r_cell.left + 1,
+                        y_top + box_pad_y,
+                        r_cell.right - 1,
+                        y_bot - box_pad_y,
+                        corner,
+                        corner,
+                    );
+                    SelectObject(mem_dc, ob);
+                    SelectObject(mem_dc, op);
+                    DeleteObject(aura_brush as _);
+                    DeleteObject(aura_pen as _);
+                }
+                SetTextColor(mem_dc, col);
                 let w_val = to_wide(&row.history[i].text);
                 DrawTextW(
                     mem_dc,
@@ -935,7 +1122,7 @@ unsafe extern "system" fn main_wnd_proc(
                 y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
             };
             ScreenToClient(hwnd, &mut pt);
-            if (*state_ptr).hit_test_button(pt.x, pt.y).is_some() {
+            if (*state_ptr).hit_test(pt.x, pt.y).is_some() {
                 HTCLIENT as LRESULT
             } else {
                 HTCAPTION as LRESULT
@@ -948,10 +1135,9 @@ unsafe extern "system" fn main_wnd_proc(
         }
         WM_APP_PING_READY => {
             let state = &mut *state_ptr;
-            let active_cycle = state.engine.current_cycle();
             let mut any_updated = false;
             while let Ok(ev) = state.rx.try_recv() {
-                if ev.cycle != active_cycle {
+                if ev.cycle != state.engine.target_cycle(ev.target_idx) {
                     continue;
                 }
                 if let Some(row) = state.stats.rows.get_mut(ev.target_idx) {
@@ -1018,10 +1204,12 @@ unsafe extern "system" fn main_wnd_proc(
                 }
             } else if wparam == TOOLTIP_TIMER_ID {
                 KillTimer(hwnd, TOOLTIP_TIMER_ID);
-                if let Some(kind) = state.hovered_btn {
-                        if let Some(btn) = state.layout.buttons.iter().find(|b| b.kind == kind) {
-                            let text = state.tooltip_text(kind);
-                            state.tooltip.show(hwnd, btn.rect, &text);
+                    if let Some(item) = state.hovered {
+                        if let Some(rect) = state.item_rect(item) {
+                            let text = state.tooltip_text(item);
+                            if !text.is_empty() {
+                                state.tooltip.show(hwnd, rect, &text);
+                            }
                         }
                     }
                 } else if wparam == SETTLE_TIMER_ID {
@@ -1045,9 +1233,9 @@ unsafe extern "system" fn main_wnd_proc(
                 TrackMouseEvent(&mut tme);
                 state.tracking_mouse = true;
             }
-            let hovered = state.hit_test_button(x, y);
-            if hovered != state.hovered_btn {
-                state.hovered_btn = hovered;
+            let hovered = state.hit_test(x, y);
+            if hovered != state.hovered {
+                state.hovered = hovered;
                 state.cancel_tooltip();
                 if hovered.is_some() {
                     SetTimer(hwnd, TOOLTIP_TIMER_ID, TOOLTIP_DELAY_MS, None);
@@ -1059,8 +1247,8 @@ unsafe extern "system" fn main_wnd_proc(
         WM_MOUSELEAVE => {
             let state = &mut *state_ptr;
             state.tracking_mouse = false;
-            if state.hovered_btn.is_some() {
-                state.hovered_btn = None;
+            if state.hovered.is_some() {
+                state.hovered = None;
                 InvalidateRect(hwnd, ptr::null(), 0);
             }
             state.cancel_tooltip();
@@ -1068,7 +1256,7 @@ unsafe extern "system" fn main_wnd_proc(
         
         }
         WM_SETCURSOR => {
-            if (lparam & 0xFFFF) == 1 && (*state_ptr).hovered_btn.is_some() {
+            if (lparam & 0xFFFF) == 1 && (*state_ptr).hovered.is_some() {
                 SetCursor(LoadCursorW(ptr::null_mut(), IDC_HAND));
                 return 1;
             }
@@ -1081,47 +1269,132 @@ unsafe extern "system" fn main_wnd_proc(
         WM_LBUTTONUP => {
             let x = (lparam & 0xFFFF) as i16 as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
-            let clicked = (*state_ptr).hit_test_button(x, y);
-            if let Some(btn) = clicked {
-                match btn {
-                    TopBtn::Set => {
-                        let original_cfg = (*state_ptr).config.clone();
-                        let saved = show_settings_dialog(hwnd, &original_cfg);
-                        let state = &mut *state_ptr;
-                        match saved {
-                            Some(new_cfg) => state.apply_config_change(new_cfg, true),
-                            None => state.apply_config_change(original_cfg, false),
-                        }
+            let clicked = (*state_ptr).hit_test(x, y);
+            match clicked {
+                Some(HoverItem::Top(TopBtn::Set)) => {
+                    let original_cfg = (*state_ptr).config.clone();
+                    let saved = show_settings_dialog(hwnd, &original_cfg);
+                    let state = &mut *state_ptr;
+                    match saved {
+                        Some(new_cfg) => state.apply_config_change(new_cfg, true),
+                        None => state.apply_config_change(original_cfg, false),
                     }
-                    TopBtn::Update => {
-                        if !(*state_ptr).updating {
-                            if let Some(info) = (*state_ptr).available_update.clone() {
-                                let display_tag = if info.tag.starts_with(['v', 'V']) {
-                                    info.tag.clone()
-                                } else {
-                                    format!("v{}", info.tag)
-                                };
-                                let prompt = to_wide(&format!(
-                                    "A new version of {APP_NAME} ({display_tag}) is available.\n\
-                                     Current version: v{APP_VERSION}\n\n\
-                                     Do you want to download, replace the current executable, and restart {APP_NAME} now?\n\
-                                     (Your settings in config.ini will be preserved.)"
-                                ));
-                                let caption = to_wide(&format!("Update Available — {APP_NAME}"));
-                                let choice = MessageBoxW(
-                                    hwnd,
-                                    prompt.as_ptr(),
-                                    caption.as_ptr(),
-                                    MB_YESNO | MB_ICONQUESTION,
-                                );
-                                if choice == IDYES {
-                                    (*state_ptr).start_update_install(info);
-                                }
+                }
+                Some(HoverItem::Top(TopBtn::Update)) => {
+                    if !(*state_ptr).updating {
+                        if let Some(info) = (*state_ptr).available_update.clone() {
+                            let display_tag = if info.tag.starts_with(['v', 'V']) {
+                                info.tag.clone()
+                            } else {
+                                format!("v{}", info.tag)
+                            };
+                            let prompt = to_wide(&format!(
+                                "A new version of {APP_NAME} ({display_tag}) is available.\n\
+                                 Current version: v{APP_VERSION}\n\n\
+                                 Do you want to download, replace the current executable, and restart {APP_NAME} now?\n\
+                                 (Your settings in config.ini will be preserved.)"
+                            ));
+                            let caption = to_wide(&format!("Update Available — {APP_NAME}"));
+                            let choice = MessageBoxW(
+                                hwnd,
+                                prompt.as_ptr(),
+                                caption.as_ptr(),
+                                MB_YESNO | MB_ICONQUESTION,
+                            );
+                            if choice == IDYES {
+                                (*state_ptr).start_update_install(info);
                             }
                         }
                     }
-                    _ => (*state_ptr).handle_quick_button(btn),
                 }
+                Some(HoverItem::Top(btn)) => (*state_ptr).handle_quick_button(btn),
+                Some(HoverItem::RowMethod(idx)) => {
+                    let state = &mut *state_ptr;
+                    let global = state.config.ping_method;
+                    if let Some(t) = state.config.targets.get_mut(idx) {
+                        if t.kind != TargetKind::Http {
+                            let old_eff = t.effective_method(global);
+                            t.cycle_method_for_global(global);
+                            let new_method = t.method;
+                            let new_eff = t.effective_method(global);
+                            state.engine.set_target_method(idx, new_method);
+                            if let Some(row) = state.stats.rows.get_mut(idx) {
+                                row.target.method = new_method;
+                                if old_eff != new_eff {
+                                    state.engine.bump_target_cycle(idx);
+                                    row.reset();
+                                }
+                            }
+                            state.config.save();
+                            let title = state.stats.build_window_title();
+                            state.update_title(&title);
+                            InvalidateRect(hwnd, ptr::null(), 0);
+                        }
+                    }
+                }
+                None => {}
+            }
+            0
+        }
+        WM_RBUTTONDOWN => {
+            (*state_ptr).cancel_tooltip();
+            0
+        }
+        WM_RBUTTONUP => {
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            match (*state_ptr).hit_test(x, y) {
+                Some(HoverItem::Top(TopBtn::Method)) => {
+                    let state = &mut *state_ptr;
+                    let global = state.config.ping_method;
+                    let mut any_changed = false;
+                    for (idx, t) in state.config.targets.iter_mut().enumerate() {
+                        if t.kind != TargetKind::Http && t.method.is_some() {
+                            let old_eff = t.effective_method(global);
+                            t.method = None;
+                            let new_eff = t.effective_method(global);
+                            state.engine.set_target_method(idx, None);
+                            if let Some(row) = state.stats.rows.get_mut(idx) {
+                                row.target.method = None;
+                                if old_eff != new_eff {
+                                    state.engine.bump_target_cycle(idx);
+                                    row.reset();
+                                }
+                            }
+                            any_changed = true;
+                        }
+                    }
+                    if any_changed {
+                        state.config.save();
+                        let title = state.stats.build_window_title();
+                        state.update_title(&title);
+                        InvalidateRect(hwnd, ptr::null(), 0);
+                    }
+                }
+                Some(HoverItem::RowMethod(idx)) => {
+                    let state = &mut *state_ptr;
+                    let global = state.config.ping_method;
+                    if let Some(t) = state.config.targets.get_mut(idx) {
+                        if t.kind != TargetKind::Http && t.method.is_some() {
+                            let old_eff = t.effective_method(global);
+                            t.method = None;
+                            let new_eff = t.effective_method(global);
+                            state.engine.set_target_method(idx, None);
+                            if let Some(row) = state.stats.rows.get_mut(idx) {
+                                row.target.method = None;
+                                if old_eff != new_eff {
+                                    state.engine.bump_target_cycle(idx);
+                                    row.reset();
+                                }
+                            }
+                            state.config.save();
+                            let title = state.stats.build_window_title();
+                            state.update_title(&title);
+                            InvalidateRect(hwnd, ptr::null(), 0);
+                        }
+                    }
+                }
+                _ => {}
             }
             0
         }
@@ -1243,7 +1516,7 @@ pub fn run() {
             font_hist,
             font_sep,
             layout,
-            hovered_btn: None,
+            hovered: None,
             tracking_mouse: false,
             anim_timer_active: false,
             tooltip: DarkTooltip::new(hwnd, scale),
@@ -1270,6 +1543,7 @@ pub fn run() {
         s.engine.start_workers(
             hwnd,
             &s.config.targets,
+            &s.config.proxy_probe_host,
             s.config.refresh_interval_ms,
             s.config.timeout_ms,
             s.tx.clone(),

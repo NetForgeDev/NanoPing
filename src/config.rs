@@ -15,6 +15,7 @@ const DEFAULT_HEADER: &str = "\
 ; ping_method: icmp (Native Windows API), tcp (Port 443), or udp (DNS/QUIC/STUN/Port Probe)
 ; wave_speed: normal, slow, fast, very fast
 ; wave_style: off, pulse, fade, slide
+; targets syntax: host[|method] or s5://[user:pass@]host:port[|method] or http://[user:pass@]host:port
 
 ";
 
@@ -200,9 +201,214 @@ impl Default for PingColors {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetKind {
+    Direct,
+    Socks5,
+    Http,
+}
+
+impl TargetKind {
+    pub fn as_badge(self) -> &'static str {
+        match self {
+            Self::Direct => "IP",
+            Self::Socks5 => "S5",
+            Self::Http => "HT",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Direct => Self::Socks5,
+            Self::Socks5 => Self::Http,
+            Self::Http => Self::Direct,
+        }
+    }
+
+    pub fn color(self) -> u32 {
+        match self {
+            Self::Direct => rgb(0x88, 0x88, 0x88),
+            Self::Socks5 => rgb(0x00, 0xdd, 0xff),
+            Self::Http => rgb(0xcc, 0x77, 0xff),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetEntry {
+    pub address: String,
+    pub kind: TargetKind,
+    /// `None` = AUTO (inherits global ping method); `Some(m)` = per-target override.
+    pub method: Option<PingMethod>,
+}
+
+impl TargetEntry {
+    pub fn direct(addr: &str) -> Self {
+        Self {
+            address: addr.to_string(),
+            kind: TargetKind::Direct,
+            method: None,
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let (addr_part, mut method) = if let Some((left, right)) = trimmed.rsplit_once('|') {
+            match right.trim().to_ascii_lowercase().as_str() {
+                "icmp" => (left.trim(), Some(PingMethod::Icmp)),
+                "tcp" => (left.trim(), Some(PingMethod::Tcp)),
+                "udp" => (left.trim(), Some(PingMethod::Udp)),
+                "auto" => (left.trim(), None),
+                _ => (trimmed, None),
+            }
+        } else {
+            (trimmed, None)
+        };
+
+        let lower = addr_part.to_ascii_lowercase();
+        let (kind, address) = if lower.starts_with("socks5://") {
+            (TargetKind::Socks5, addr_part[9..].trim())
+        } else if lower.starts_with("s5://") {
+            (TargetKind::Socks5, addr_part[5..].trim())
+        } else if lower.starts_with("http://") {
+            (TargetKind::Http, addr_part[7..].trim())
+        } else if lower.starts_with("ht://") {
+            (TargetKind::Http, addr_part[5..].trim())
+        } else {
+            (TargetKind::Direct, addr_part.trim())
+        };
+
+        if address.is_empty() {
+            return None;
+        }
+
+        match kind {
+            TargetKind::Http => method = Some(PingMethod::Tcp),
+            TargetKind::Socks5 if method == Some(PingMethod::Icmp) => {
+                method = Some(PingMethod::Tcp);
+            }
+            _ => {}
+        }
+
+        Some(Self {
+            address: address.to_string(),
+            kind,
+            method,
+        })
+    }
+
+    pub fn to_config_str(&self) -> String {
+        let prefix = match self.kind {
+            TargetKind::Direct => "",
+            TargetKind::Socks5 => "s5://",
+            TargetKind::Http => "http://",
+        };
+        let suffix = match (self.kind, self.method) {
+            (TargetKind::Http, _) | (_, None) => String::new(),
+            (_, Some(m)) => format!("|{}", m.as_str()),
+        };
+        format!("{prefix}{}{suffix}", self.address)
+    }
+
+    /// Returns display text for the main HUD, hiding optional `user:pass@` proxy credentials.
+    pub fn display_label(&self) -> &str {
+        if self.kind != TargetKind::Direct {
+            if let Some((_, host_port)) = self.address.rsplit_once('@') {
+                if !host_port.is_empty() {
+                    return host_port;
+                }
+            }
+        }
+        &self.address
+    }
+
+    /// Splits optional `user:pass@host:port` proxy address into `(Option<(user, pass)>, host_port)`.
+    pub fn split_proxy_auth(&self) -> (Option<(&str, &str)>, &str) {
+        if let Some((creds, host_port)) = self.address.rsplit_once('@') {
+            if let Some((user, pass)) = creds.split_once(':') {
+                return (Some((user, pass)), host_port);
+            }
+            return (Some((creds, "")), host_port);
+        }
+        (None, &self.address)
+    }
+
+    pub fn effective_method(&self, global: PingMethod) -> PingMethod {
+        match self.kind {
+            TargetKind::Http => PingMethod::Tcp,
+            TargetKind::Socks5 => match self.method {
+                Some(PingMethod::Udp) => PingMethod::Udp,
+                Some(_) => PingMethod::Tcp,
+                None => {
+                    if global == PingMethod::Udp {
+                        PingMethod::Udp
+                    } else {
+                        PingMethod::Tcp
+                    }
+                }
+            },
+            TargetKind::Direct => self.method.unwrap_or(global),
+        }
+    }
+
+    pub fn is_overridden(&self) -> bool {
+        self.kind != TargetKind::Http && self.method.is_some()
+    }
+
+    pub fn cycle_method(&mut self) {
+        self.method = match self.kind {
+            TargetKind::Direct => match self.method {
+                None => Some(PingMethod::Icmp),
+                Some(PingMethod::Icmp) => Some(PingMethod::Tcp),
+                Some(PingMethod::Tcp) => Some(PingMethod::Udp),
+                Some(PingMethod::Udp) => None,
+            },
+            TargetKind::Socks5 => match self.method {
+                None => Some(PingMethod::Tcp),
+                Some(PingMethod::Tcp) => Some(PingMethod::Udp),
+                _ => None,
+            },
+            TargetKind::Http => Some(PingMethod::Tcp),
+        };
+    }
+
+    /// Cycles directly to the next distinct method on main-window clicks,
+    /// snapping back to `None` (AUTO) when wrapping to the global default.
+    pub fn cycle_method_for_global(&mut self, global: PingMethod) {
+        if self.kind == TargetKind::Http {
+            self.method = Some(PingMethod::Tcp);
+            return;
+        }
+        let cur = self.effective_method(global);
+        let next = match self.kind {
+            TargetKind::Direct => cur.next(),
+            TargetKind::Socks5 => match cur {
+                PingMethod::Udp => PingMethod::Tcp,
+                _ => PingMethod::Udp,
+            },
+            TargetKind::Http => PingMethod::Tcp,
+        };
+        self.method = Some(next);
+    }
+
+    pub fn method_label(&self) -> &'static str {
+        match self.kind {
+            TargetKind::Http => "TCP",
+            _ => match self.method {
+                None => "AUTO",
+                Some(m) => m.as_upper(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub targets: Vec<String>,
+    pub targets: Vec<TargetEntry>,
     pub always_on_top: bool,
     pub history_count: usize,
     pub loss_window_size: usize,
@@ -219,6 +425,7 @@ pub struct Config {
     pub font_size: u32,
     pub opacity: u8,
     pub check_updates: bool,
+    pub proxy_probe_host: String,
     pub colors: PingColors,
 }
 
@@ -226,9 +433,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             targets: vec![
-                "8.8.8.8".to_string(),
-                "4.2.2.4".to_string(),
-                "google.com".to_string(),
+                TargetEntry::direct("8.8.8.8"),
+                TargetEntry::direct("4.2.2.4"),
+                TargetEntry::direct("google.com"),
             ],
             always_on_top: true,
             history_count: 3,
@@ -246,19 +453,17 @@ impl Default for Config {
             font_size: 14,
             opacity: 100,
             check_updates: true,
+            proxy_probe_host: "1.1.1.1".to_string(),
             colors: PingColors::default(),
         }
     }
 }
 
-pub fn config_path() -> PathBuf {
+fn local_config_path() -> PathBuf {
     #[cfg(debug_assertions)]
     {
         if let Ok(cwd) = std::env::current_dir() {
-            let dev_cfg = cwd.join("config.ini");
-            if dev_cfg.exists() {
-                return dev_cfg;
-            }
+            return cwd.join("config.ini");
         }
     }
 
@@ -267,6 +472,64 @@ pub fn config_path() -> PathBuf {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     exe_dir.join("config.ini")
+}
+
+fn appdata_config_path() -> PathBuf {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let p = PathBuf::from(appdata).join("NanoPing").join("config.ini");
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    local_config_path()
+}
+
+/// Returns `true` when using portable `config.ini` beside the executable.
+pub fn is_portable_mode() -> bool {
+    local_config_path().exists()
+}
+
+/// Auto-detects portable mode (local `config.ini` beside `.exe`) vs standard Windows `%APPDATA%\NanoPing\config.ini`.
+pub fn config_path() -> PathBuf {
+    let local = local_config_path();
+    if local.exists() {
+        local
+    } else {
+        appdata_config_path()
+    }
+}
+
+/// Migrates `config.ini` between Portable (beside `.exe`) and standard AppData (`%APPDATA%\NanoPing\`).
+pub fn switch_config_storage(cfg: &Config, portable: bool) -> Result<(), &'static str> {
+    let local = local_config_path();
+    let appdata = appdata_config_path();
+    if local == appdata {
+        cfg.save();
+        return Ok(());
+    }
+
+    let content = cfg.format_ini();
+    if portable {
+        fs::write(&local, content)
+            .map_err(|_| "Cannot write config.ini beside NanoPing.exe (check folder permissions).")?;
+        if appdata.exists() {
+            let _ = fs::remove_file(&appdata);
+            if let Some(dir) = appdata.parent() {
+                let _ = fs::remove_dir(dir);
+            }
+        }
+    } else {
+        if let Some(dir) = appdata.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|_| "Cannot create %APPDATA%\\NanoPing directory.")?;
+        }
+        fs::write(&appdata, content)
+            .map_err(|_| "Cannot write config.ini to %APPDATA%\\NanoPing.")?;
+        if local.exists() {
+            let _ = fs::remove_file(&local);
+        }
+    }
+    Ok(())
 }
 
 fn parse_bool(val: &str, fallback: bool) -> bool {
@@ -337,18 +600,14 @@ impl Config {
             "color_timeout",
             "opacity",
             "check_updates",
+            "proxy_probe_host",
         ];
         let needs_rewrite = expected_keys.iter().any(|k| !map.contains_key(*k));
 
-        let targets: Vec<String> = map
+        let targets: Vec<TargetEntry> = map
             .get("targets")
-            .map(|s| {
-                s.split(',')
-                    .map(|x| x.trim().to_string())
-                    .filter(|x| !x.is_empty())
-                    .collect()
-            })
-            .filter(|v: &Vec<String>| !v.is_empty())
+            .map(|s| s.split(',').filter_map(TargetEntry::parse).collect())
+            .filter(|v: &Vec<TargetEntry>| !v.is_empty())
             .unwrap_or_else(|| defaults.targets.clone());
 
         let parse_pos = |key: &str| -> Option<i32> {
@@ -458,6 +717,11 @@ impl Config {
                 .get("check_updates")
                 .map(|v| parse_bool(v, defaults.check_updates))
                 .unwrap_or(defaults.check_updates),
+            proxy_probe_host: map
+                .get("proxy_probe_host")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| defaults.proxy_probe_host.clone()),
         };
 
         if needs_rewrite {
@@ -466,7 +730,7 @@ impl Config {
         cfg
     }
 
-    pub fn save(&self) {
+    fn format_ini(&self) -> String {
         let wx = self
             .window_x
             .map(|v| v.to_string())
@@ -476,7 +740,7 @@ impl Config {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "center".to_string());
 
-        let content = format!(
+        format!(
             "{header}[SETTINGS]\n\
 targets = {targets}\n\
 always_on_top = {always_on_top}\n\
@@ -495,12 +759,18 @@ wave_speed = {wave_speed}\n\
 font_size = {font_size}\n\
 opacity = {opacity}\n\
 check_updates = {check_updates}\n\
+proxy_probe_host = {proxy_probe_host}\n\
 color_low = {color_low}\n\
 color_medium = {color_medium}\n\
 color_high = {color_high}\n\
 color_timeout = {color_timeout}\n",
             header = DEFAULT_HEADER,
-            targets = self.targets.join(", "),
+            targets = self
+                .targets
+                .iter()
+                .map(|t| t.to_config_str())
+                .collect::<Vec<_>>()
+                .join(", "),
             always_on_top = fmt_bool(self.always_on_top),
             history_count = self.history_count,
             loss_window_size = self.loss_window_size,
@@ -515,13 +785,26 @@ color_timeout = {color_timeout}\n",
             font_size = self.font_size,
             opacity = self.opacity,
             check_updates = fmt_bool(self.check_updates),
+            proxy_probe_host = self.proxy_probe_host,
             color_low = format_hex_color(self.colors.low),
             color_medium = format_hex_color(self.colors.medium),
             color_high = format_hex_color(self.colors.high),
             color_timeout = format_hex_color(self.colors.timeout),
-        );
+        )
+    }
 
-        let _ = fs::write(config_path(), content);
+    pub fn save(&self) {
+        let path = config_path();
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(path, self.format_ini());
+    }
+}
+
+impl Config {
+    pub fn has_proxy_targets(&self) -> bool {
+        self.targets.iter().any(|t| t.kind != TargetKind::Direct)
     }
 }
 

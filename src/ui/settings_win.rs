@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
-use crate::config::{config_path, Config, PingColors, PingMethod, WaveSpeed, WaveStyle};
+use crate::config::{config_path, is_portable_mode, switch_config_storage, Config, PingColors, PingMethod, TargetEntry, TargetKind, WaveSpeed, WaveStyle};
 use crate::ui::about_win::show_about_dialog;
 use crate::ui::main_win::WM_APP_PREVIEW_CONFIG;
 use crate::ui::win_util::{
@@ -58,6 +58,7 @@ const ID_COLOR_TO_BTN: u16 = 116;
 const ID_OPACITY_DEC_BTN: u16 = 117;
 const ID_OPACITY_INC_BTN: u16 = 118;
 const ID_CHECK_UPD_BTN: u16 = 119;
+const ID_PORTABLE_BTN: u16 = 120;
 
 const ID_EDIT_HIST: u16 = 200;
 const ID_EDIT_LOSS: u16 = 201;
@@ -69,9 +70,11 @@ const ID_EDIT_OPACITY: u16 = 206;
 
 const ID_TARGET_EDIT_BASE: u16 = 1000;
 const ID_TARGET_DEL_BASE: u16 = 2000;
+const ID_TARGET_KIND_BASE: u16 = 3000;
+const ID_TARGET_METHOD_BASE: u16 = 4000;
 
 struct Draft {
-    targets: Vec<String>,
+    targets: Vec<TargetEntry>,
     method: PingMethod,
     hist: String,
     loss: String,
@@ -82,6 +85,7 @@ struct Draft {
     save_position: bool,
     autostart: bool,
     check_updates: bool,
+    portable: bool,
     wave_style: WaveStyle,
     wave_speed: WaveSpeed,
     font_size: String,
@@ -103,6 +107,7 @@ impl Draft {
             save_position: c.save_position,
             autostart: c.autostart,
             check_updates: c.check_updates,
+            portable: is_portable_mode(),
             wave_style: c.wave_style,
             wave_speed: c.wave_speed,
             font_size: c.font_size.to_string(),
@@ -151,7 +156,9 @@ unsafe fn get_edit_text(hwnd: HWND) -> String {
 
 impl SettingsState {
     unsafe fn sync_edits_to_draft(&mut self) {
-        self.draft.targets = self.target_edits.iter().map(|&h| get_edit_text(h)).collect();
+        for (entry, &h) in self.draft.targets.iter_mut().zip(self.target_edits.iter()) {
+            entry.address = get_edit_text(h);
+        }
         self.draft.hist = get_edit_text(self.edit_hist);
         self.draft.loss = get_edit_text(self.edit_loss);
         self.draft.avg = get_edit_text(self.edit_avg);
@@ -167,12 +174,22 @@ impl SettingsState {
         }
         self.sync_edits_to_draft();
 
-        let targets: Vec<String> = self
+        let targets: Vec<TargetEntry> = self
             .draft
             .targets
             .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .filter_map(|t| {
+                let addr = t.address.trim();
+                if addr.is_empty() {
+                    None
+                } else {
+                    Some(TargetEntry {
+                        address: addr.to_string(),
+                        kind: t.kind,
+                        method: t.method,
+                    })
+                }
+            })
             .collect();
 
         let mut cfg = self.base_config.clone();
@@ -360,23 +377,26 @@ impl SettingsState {
         );
         y += px(25);
 
-        // 3-column Targets grid
-        let t_gap = px(6);
-        let t_col_w = (content_w - t_gap * 2) / 3;
+        // 2-column Targets grid: [Address] [IP/S5/HT] [AUTO/ICMP/TCP/UDP] [X]
+        let t_gap = px(8);
+        let t_col_w = (content_w - t_gap) / 2;
+        let kind_w = px(24);
+        let meth_w = px(38);
         let del_w = px(20);
-        let ent_w = t_col_w - del_w - px(2);
+        let t_btn_gap = px(2);
+        let ent_w = t_col_w - kind_w - meth_w - del_w - t_btn_gap * 3;
         let row_h = px(21);
 
         let targets_snapshot = self.draft.targets.clone();
-        for (idx, val) in targets_snapshot.iter().enumerate() {
-            let r = (idx / 3) as i32;
-            let c = (idx % 3) as i32;
+        for (idx, entry) in targets_snapshot.iter().enumerate() {
+            let r = (idx / 2) as i32;
+            let c = (idx % 2) as i32;
             let rx = pad + c * (t_col_w + t_gap);
             let ry = y + r * (row_h + px(4));
 
             let eh = add_ctrl(
                 &cls_edit,
-                val,
+                &entry.address,
                 WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
                 rx,
                 ry,
@@ -387,11 +407,38 @@ impl SettingsState {
             );
             self.target_edits.push(eh);
 
+            let kx = rx + ent_w + t_btn_gap;
+            add_ctrl(
+                &cls_btn,
+                entry.kind.as_badge(),
+                WS_TABSTOP | BS_OWNERDRAW as u32,
+                kx,
+                ry,
+                kind_w,
+                row_h,
+                ID_TARGET_KIND_BASE + idx as u16,
+                self.font_bold,
+            );
+
+            let mx = kx + kind_w + t_btn_gap;
+            add_ctrl(
+                &cls_btn,
+                entry.method_label(),
+                WS_TABSTOP | BS_OWNERDRAW as u32,
+                mx,
+                ry,
+                meth_w,
+                row_h,
+                ID_TARGET_METHOD_BASE + idx as u16,
+                self.font_bold,
+            );
+
+            let dx = mx + meth_w + t_btn_gap;
             add_ctrl(
                 &cls_btn,
                 "X",
                 WS_TABSTOP | BS_OWNERDRAW as u32,
-                rx + ent_w + px(2),
+                dx,
                 ry,
                 del_w,
                 row_h,
@@ -400,7 +447,7 @@ impl SettingsState {
             );
         }
 
-        let target_rows = ((targets_snapshot.len() + 2) / 3).max(1) as i32;
+        let target_rows = ((targets_snapshot.len() + 1) / 2).max(1) as i32;
         y += target_rows * (row_h + px(4)) + px(8);
 
         // 2-column settings grid
@@ -701,9 +748,9 @@ impl SettingsState {
         }
         y += c_h + px(12);
 
-        // Bottom 3 buttons: DEFAULTS | OPEN INI | SAVE
-        let b_gap = px(8);
-        let b_w = (content_w - b_gap * 2) / 3;
+        // Bottom 4 buttons: DEFAULTS | PORTABLE/APPDATA | OPEN INI | SAVE
+        let b_gap = px(6);
+        let b_w = (content_w - b_gap * 3) / 4;
         let b_h = px(25);
         add_ctrl(
             &cls_btn,
@@ -718,9 +765,20 @@ impl SettingsState {
         );
         add_ctrl(
             &cls_btn,
-            "OPEN INI",
+            if self.draft.portable { "PORTABLE" } else { "APPDATA" },
             WS_TABSTOP | BS_OWNERDRAW as u32,
             pad + b_w + b_gap,
+            y,
+            b_w,
+            b_h,
+            ID_PORTABLE_BTN,
+            self.font_bold,
+        );
+        add_ctrl(
+            &cls_btn,
+            "OPEN INI",
+            WS_TABSTOP | BS_OWNERDRAW as u32,
+            pad + (b_w + b_gap) * 2,
             y,
             b_w,
             b_h,
@@ -731,7 +789,7 @@ impl SettingsState {
             &cls_btn,
             "SAVE",
             WS_TABSTOP | BS_OWNERDRAW as u32,
-            pad + (b_w + b_gap) * 2,
+            pad + (b_w + b_gap) * 3,
             y,
             b_w,
             b_h,
@@ -923,6 +981,21 @@ impl SettingsState {
                 rgb(0xcc, 0x33, 0x33),
                 rgb(0xff, 0xff, 0xff),
             ),
+            ID_PORTABLE_BTN => {
+                if self.draft.portable {
+                    (
+                        "PORTABLE".to_string(),
+                        rgb(0x14, 0x33, 0x22),
+                        rgb(0x00, 0xff, 0x66),
+                    )
+                } else {
+                    (
+                        "APPDATA".to_string(),
+                        rgb(0x16, 0x28, 0x38),
+                        rgb(0x00, 0xcc, 0xff),
+                    )
+                }
+            }
             ID_OPEN_INI_BTN => (
                 "OPEN INI".to_string(),
                 rgb(0x44, 0x44, 0x44),
@@ -933,11 +1006,36 @@ impl SettingsState {
                 rgb(0x00, 0xaa, 0x44),
                 rgb(0xff, 0xff, 0xff),
             ),
-            x if x >= ID_TARGET_DEL_BASE => (
+            x if (ID_TARGET_DEL_BASE..ID_TARGET_KIND_BASE).contains(&x) => (
                 "X".to_string(),
                 rgb(0x1b, 0x1b, 0x1b),
                 rgb(0xff, 0x44, 0x44),
             ),
+            x if (ID_TARGET_KIND_BASE..ID_TARGET_METHOD_BASE).contains(&x) => {
+                let idx = (x - ID_TARGET_KIND_BASE) as usize;
+                if let Some(t) = self.draft.targets.get(idx) {
+                    (
+                        t.kind.as_badge().to_string(),
+                        rgb(0x1f, 0x1f, 0x1f),
+                        t.kind.color(),
+                    )
+                } else {
+                    ("IP".to_string(), rgb(0x1f, 0x1f, 0x1f), rgb(0x88, 0x88, 0x88))
+                }
+            }
+            x if x >= ID_TARGET_METHOD_BASE => {
+                let idx = (x - ID_TARGET_METHOD_BASE) as usize;
+                if let Some(t) = self.draft.targets.get(idx) {
+                    let fg = match (t.kind, t.method) {
+                        (TargetKind::Http, _) => method_color(PingMethod::Tcp),
+                        (_, Some(m)) => method_color(m),
+                        (_, None) => rgb(0x88, 0x88, 0x88),
+                    };
+                    (t.method_label().to_string(), rgb(0x1f, 0x1f, 0x1f), fg)
+                } else {
+                    ("AUTO".to_string(), rgb(0x1f, 0x1f, 0x1f), rgb(0x88, 0x88, 0x88))
+                }
+            }
             _ => (String::new(), rgb(0x22, 0x22, 0x22), rgb(0xff, 0xff, 0xff)),
         };
 
@@ -990,12 +1088,22 @@ impl SettingsState {
     unsafe fn try_save(&mut self) {
         self.sync_edits_to_draft();
 
-        let targets: Vec<String> = self
+        let targets: Vec<TargetEntry> = self
             .draft
             .targets
             .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .filter_map(|t| {
+                let addr = t.address.trim();
+                if addr.is_empty() {
+                    None
+                } else {
+                    Some(TargetEntry {
+                        address: addr.to_string(),
+                        kind: t.kind,
+                        method: t.method,
+                    })
+                }
+            })
             .collect();
 
         if targets.is_empty() {
@@ -1049,6 +1157,15 @@ impl SettingsState {
         cfg.font_size = font_size;
         cfg.opacity = opacity;
         cfg.colors = self.draft.colors;
+
+        if self.draft.portable != is_portable_mode() {
+            if let Err(err_msg) = switch_config_storage(&cfg, self.draft.portable) {
+                let msg = to_wide(err_msg);
+                let cap = to_wide("Storage Mode Error");
+                MessageBoxW(self.hwnd, msg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONERROR);
+                return;
+            }
+        }
 
         self.result = Some(cfg);
         self.close();
@@ -1121,7 +1238,7 @@ unsafe extern "system" fn settings_wnd_proc(
                     }
                     ID_ADD_TARGET => {
                         state.sync_edits_to_draft();
-                        state.draft.targets.push(String::new());
+                        state.draft.targets.push(TargetEntry::direct(""));
                         state.rebuild_ui(false);
                         state.emit_live_preview();
                     }
@@ -1198,8 +1315,14 @@ unsafe extern "system" fn settings_wnd_proc(
                             state.emit_live_preview();
                         }
                     }
+                    ID_PORTABLE_BTN => {
+                        state.draft.portable = !state.draft.portable;
+                        InvalidateRect(lparam as HWND, ptr::null(), 0);
+                    }
                     ID_DEFAULTS_BTN => {
+                        let keep_portable = state.draft.portable;
                         state.draft = Draft::from_config(&Config::default());
+                        state.draft.portable = keep_portable;
                         state.rebuild_ui(false);
                         state.emit_live_preview();
                     }
@@ -1209,13 +1332,40 @@ unsafe extern "system" fn settings_wnd_proc(
                     ID_SAVE_BTN => {
                         state.try_save();
                     }
-                    x if x >= ID_TARGET_DEL_BASE => {
+                    x if (ID_TARGET_DEL_BASE..ID_TARGET_KIND_BASE).contains(&x) => {
                         let idx = (x - ID_TARGET_DEL_BASE) as usize;
                         state.sync_edits_to_draft();
                         if idx < state.draft.targets.len() {
                             state.draft.targets.remove(idx);
                             state.rebuild_ui(false);
                             state.emit_live_preview();
+                        }
+                    }
+                    x if (ID_TARGET_KIND_BASE..ID_TARGET_METHOD_BASE).contains(&x) => {
+                        let idx = (x - ID_TARGET_KIND_BASE) as usize;
+                        state.sync_edits_to_draft();
+                        if let Some(t) = state.draft.targets.get_mut(idx) {
+                            t.kind = t.kind.next();
+                            match t.kind {
+                                TargetKind::Http => t.method = Some(PingMethod::Tcp),
+                                TargetKind::Socks5 if t.method == Some(PingMethod::Icmp) => {
+                                    t.method = Some(PingMethod::Tcp);
+                                }
+                                TargetKind::Direct => t.method = None,
+                                _ => {}
+                            }
+                            state.rebuild_ui(false);
+                            state.emit_live_preview();
+                        }
+                    }
+                    x if x >= ID_TARGET_METHOD_BASE => {
+                        let idx = (x - ID_TARGET_METHOD_BASE) as usize;
+                        if let Some(t) = state.draft.targets.get_mut(idx) {
+                            if t.kind != TargetKind::Http {
+                                t.cycle_method();
+                                InvalidateRect(lparam as HWND, ptr::null(), 0);
+                                state.emit_live_preview();
+                            }
                         }
                     }
                     _ => {}

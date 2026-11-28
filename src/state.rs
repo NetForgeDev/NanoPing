@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::config::{Config, PingColors, WaveSpeed, WaveStyle};
+use crate::config::{Config, PingColors, TargetEntry, WaveSpeed, WaveStyle};
 use crate::ping::{PingResult, PingTier};
 use crate::ui::win_util::{lerp_color, rgb, BG_MAIN};
 
@@ -13,7 +13,7 @@ pub struct HistoryCell {
 }
 
 pub struct TargetStats {
-    pub target: String,
+    pub target: TargetEntry,
     pub loss_window: VecDeque<bool>,
     pub avg_window: VecDeque<u32>,
     pub history: VecDeque<HistoryCell>,
@@ -23,7 +23,7 @@ pub struct TargetStats {
 }
 
 impl TargetStats {
-    pub fn new(target: String, cfg: &Config) -> Self {
+    pub fn new(target: TargetEntry, cfg: &Config) -> Self {
         let mut history = VecDeque::with_capacity(cfg.history_count);
         for _ in 0..cfg.history_count {
             history.push_back(HistoryCell {
@@ -144,17 +144,22 @@ impl TargetStats {
         wave_speed: WaveSpeed,
         colors: &PingColors,
         now: Instant,
-    ) -> (u32, f32) {
+    ) -> (u32, f32, f32) {
         let cell = &self.history[idx];
         let target_color = Self::tier_color(cell.tier, colors);
         if !wave_style.is_enabled() {
-            return (target_color, 0.0);
+            return (target_color, 0.0, 0.0);
         }
         let Some(start) = cell.anim_start else {
-            return (target_color, 0.0);
+            return (target_color, 0.0, 0.0);
         };
 
         let (cascade_ms, fade_ms) = wave_speed.timing_ms();
+        let dur_ms = if wave_style == WaveStyle::Pulse {
+            (fade_ms * 3 / 2).max(1)
+        } else {
+            fade_ms.max(1)
+        };
         let delay = if wave_style == WaveStyle::Slide {
             (idx as u64) * (cascade_ms / 2)
         } else {
@@ -164,40 +169,46 @@ impl TargetStats {
 
         if elapsed < delay {
             return match wave_style {
-                WaveStyle::Pulse => (target_color, 0.0),
-                WaveStyle::Fade => (lerp_color(BG_MAIN, target_color, 0.20), 0.0),
+                WaveStyle::Pulse => (target_color, 0.0, 0.0),
+                WaveStyle::Fade => (lerp_color(BG_MAIN, target_color, 0.20), 0.0, 0.0),
                 WaveStyle::Slide => {
                     let col = if idx == 0 {
                         lerp_color(BG_MAIN, target_color, 0.20)
                     } else {
                         target_color
                     };
-                    (col, 1.0)
+                    (col, 1.0, 0.0)
                 }
-                WaveStyle::Off => (target_color, 0.0),
+                WaveStyle::Off => (target_color, 0.0, 0.0),
             };
         }
 
-        if elapsed >= delay + fade_ms {
-            return (target_color, 0.0);
+        if elapsed >= delay + dur_ms {
+            return (target_color, 0.0, 0.0);
         }
 
-        let t = (elapsed - delay) as f32 / fade_ms.max(1) as f32;
+        let t = (elapsed - delay) as f32 / dur_ms as f32;
         let ease = 1.0 - (1.0 - t).powi(3);
 
         match wave_style {
             WaveStyle::Pulse => {
-                let peak = match idx {
-                    0 => 0.65,
-                    1 => 0.40,
-                    _ => 0.25,
+                let env = if t < 0.22 {
+                    t / 0.22
+                } else {
+                    let d = (t - 0.22) / 0.78;
+                    (1.0 - d) * (1.0 - d)
                 };
-                let glow = lerp_color(target_color, rgb(0xff, 0xff, 0xff), peak);
-                (lerp_color(glow, target_color, ease), 0.0)
+                let (txt_peak, bg_peak) = match idx {
+                    0 => (0.95, 1.0),
+                    1 => (0.78, 0.75),
+                    _ => (0.62, 0.55),
+                };
+                let text_col = lerp_color(target_color, rgb(0xff, 0xff, 0xff), env * txt_peak);
+                (text_col, 0.0, env * bg_peak)
             }
             WaveStyle::Fade => {
                 let dim = lerp_color(BG_MAIN, target_color, 0.20);
-                (lerp_color(dim, target_color, ease), 0.0)
+                (lerp_color(dim, target_color, ease), 0.0, 0.0)
             }
             WaveStyle::Slide => {
                 let col = if idx == 0 {
@@ -206,9 +217,9 @@ impl TargetStats {
                 } else {
                     target_color
                 };
-                (col, 1.0 - ease)
+                (col, 1.0 - ease, 0.0)
             }
-            WaveStyle::Off => (target_color, 0.0),
+            WaveStyle::Off => (target_color, 0.0, 0.0),
         }
     }
 }
@@ -248,6 +259,11 @@ impl AppStats {
             return false;
         }
         let (cascade_ms, fade_ms) = wave_speed.timing_ms();
+        let dur_ms = if wave_style == WaveStyle::Pulse {
+            (fade_ms * 3 / 2).max(1)
+        } else {
+            fade_ms.max(1)
+        };
         let step = if wave_style == WaveStyle::Slide {
             cascade_ms / 2
         } else {
@@ -257,7 +273,7 @@ impl AppStats {
         for row in &mut self.rows {
             for (idx, cell) in row.history.iter_mut().enumerate() {
                 if let Some(start) = cell.anim_start {
-                    let total = (idx as u64) * step + fade_ms;
+                    let total = (idx as u64) * step + dur_ms;
                     if now.saturating_duration_since(start).as_millis() as u64 >= total {
                         cell.anim_start = None;
                     } else {

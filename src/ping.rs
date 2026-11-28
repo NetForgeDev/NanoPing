@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::windows::io::AsRawSocket;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -17,7 +17,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 use windows_sys::Win32::Networking::WinSock::WSAIoctl;
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::config::PingMethod;
+use crate::config::{PingMethod, TargetEntry, TargetKind};
 use crate::ui::main_win::WM_APP_PING_READY;
 
 const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
@@ -272,11 +272,370 @@ fn ping_udp(ip: Ipv4Addr, timeout_ms: u64, seq: u64) -> Option<u32> {
     }
 }
 
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn build_socks5_udp_domain(domain: &str, port: u16, payload: &[u8]) -> Vec<u8> {
+    let db = domain.as_bytes();
+    let mut pkt = Vec::with_capacity(7 + db.len() + payload.len());
+    pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x03, db.len() as u8]);
+    pkt.extend_from_slice(db);
+    pkt.extend_from_slice(&port.to_be_bytes());
+    pkt.extend_from_slice(payload);
+    pkt
+}
+
+fn build_tls_client_hello(sni: &str, seq: u64) -> Vec<u8> {
+    let mut exts = Vec::new();
+    // Add SNI extension only for non-IP hostnames (RFC 6066)
+    if sni.parse::<IpAddr>().is_err() && !sni.is_empty() && sni.len() <= 253 {
+        let nb = sni.as_bytes();
+        let entry_len = (nb.len() + 3) as u16;
+        let ext_len = entry_len + 2;
+        exts.extend_from_slice(&[0x00, 0x00]);
+        exts.extend_from_slice(&ext_len.to_be_bytes());
+        exts.extend_from_slice(&entry_len.to_be_bytes());
+        exts.push(0x00);
+        exts.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+        exts.extend_from_slice(nb);
+    }
+    // supported_groups: x25519 (0x001d), secp256r1 (0x0017)
+    exts.extend_from_slice(&[0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17]);
+
+    let mut body = Vec::with_capacity(96 + exts.len());
+    body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+    for i in 0..4u64 {
+        body.extend_from_slice(&seq.wrapping_add(i.wrapping_mul(0x9E37_79B9)).to_le_bytes());
+    }
+    body.push(0x00); // Session ID len
+    body.extend_from_slice(&[
+        0x00, 0x08, // 4 cipher suites
+        0xc0, 0x2f, 0xc0, 0x2b, 0x13, 0x01, 0x00, 0x9c,
+    ]);
+    body.extend_from_slice(&[0x01, 0x00]); // Compression: null
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+
+    let hs_len = body.len();
+    let rec_len = (hs_len + 4) as u16;
+    let mut pkt = Vec::with_capacity(hs_len + 9);
+    pkt.extend_from_slice(&[0x16, 0x03, 0x01]);
+    pkt.extend_from_slice(&rec_len.to_be_bytes());
+    pkt.push(0x01); // ClientHello
+    pkt.extend_from_slice(&[0x00, ((hs_len >> 8) & 0xFF) as u8, (hs_len & 0xFF) as u8]);
+    pkt.extend_from_slice(&body);
+    pkt
+}
+
+fn parse_proxy_addr(host_port: &str, default_port: u16) -> Option<SocketAddr> {
+    let trimmed = host_port.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(sa) = trimmed.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    if trimmed.contains(':') && !trimmed.starts_with('[') {
+        if let Ok(mut it) = trimmed.to_socket_addrs() {
+            return it.next();
+        }
+    }
+    (trimmed, default_port).to_socket_addrs().ok()?.next()
+}
+
+fn remaining_timeout(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    if now >= deadline {
+        None
+    } else {
+        Some(deadline - now)
+    }
+}
+
+fn socks5_handshake(
+    proxy_addr: SocketAddr,
+    auth: Option<(&str, &str)>,
+    deadline: Instant,
+) -> Option<TcpStream> {
+    let mut stream = TcpStream::connect_timeout(&proxy_addr, remaining_timeout(deadline)?).ok()?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(remaining_timeout(deadline));
+    let _ = stream.set_read_timeout(remaining_timeout(deadline));
+
+    if auth.is_some() {
+        stream.write_all(&[0x05, 0x02, 0x00, 0x02]).ok()?;
+    } else {
+        stream.write_all(&[0x05, 0x01, 0x00]).ok()?;
+    }
+
+    let mut choice = [0u8; 2];
+    stream.read_exact(&mut choice).ok()?;
+    if choice[0] != 0x05 {
+        return None;
+    }
+
+    match choice[1] {
+        0x00 => Some(stream),
+        0x02 => {
+            let (user, pass) = auth?;
+            let ub = user.as_bytes();
+            let pb = pass.as_bytes();
+            if ub.len() > 255 || pb.len() > 255 {
+                return None;
+            }
+            let mut req = Vec::with_capacity(3 + ub.len() + pb.len());
+            req.push(0x01);
+            req.push(ub.len() as u8);
+            req.extend_from_slice(ub);
+            req.push(pb.len() as u8);
+            req.extend_from_slice(pb);
+            stream.write_all(&req).ok()?;
+
+            let mut resp = [0u8; 2];
+            stream.read_exact(&mut resp).ok()?;
+            if resp[1] == 0x00 {
+                Some(stream)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn socks5_read_bound_addr(stream: &mut TcpStream) -> Option<(IpAddr, u16)> {
+    let mut hdr = [0u8; 4];
+    stream.read_exact(&mut hdr).ok()?;
+    if hdr[0] != 0x05 || hdr[1] != 0x00 {
+        return None;
+    }
+    let ip = match hdr[3] {
+        0x01 => {
+            let mut b = [0u8; 4];
+            stream.read_exact(&mut b).ok()?;
+            IpAddr::V4(Ipv4Addr::from(b))
+        }
+        0x04 => {
+            let mut b = [0u8; 16];
+            stream.read_exact(&mut b).ok()?;
+            IpAddr::V6(Ipv6Addr::from(b))
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).ok()?;
+            let mut dom = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut dom).ok()?;
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        }
+        _ => return None,
+    };
+    let mut p = [0u8; 2];
+    stream.read_exact(&mut p).ok()?;
+    Some((ip, u16::from_be_bytes(p)))
+}
+
+fn tls_probe_rtt(stream: &mut TcpStream, probe_host: &str, seq: u64, deadline: Instant) -> Option<u32> {
+    let rem = remaining_timeout(deadline)?;
+    let _ = stream.set_write_timeout(Some(rem));
+    let _ = stream.set_read_timeout(Some(rem));
+
+    let hello = build_tls_client_hello(probe_host, seq);
+    let start = Instant::now();
+    stream.write_all(&hello).ok()?;
+
+    let mut hdr = [0u8; 5];
+    stream.read_exact(&mut hdr).ok()?;
+    if hdr[0] == 0x16 || hdr[0] == 0x15 {
+        Some(start.elapsed().as_millis() as u32)
+    } else {
+        None
+    }
+}
+
+fn ping_socks5_tcp(entry: &TargetEntry, probe_host: &str, timeout_ms: u64, seq: u64) -> Option<u32> {
+    let (auth, host_port) = entry.split_proxy_auth();
+    let proxy_addr = parse_proxy_addr(host_port, 1080)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    let mut stream = socks5_handshake(proxy_addr, auth, deadline)?;
+
+    let mut req = Vec::with_capacity(10 + probe_host.len());
+    req.extend_from_slice(&[0x05, 0x01, 0x00]); // CONNECT
+    if let Ok(v4) = probe_host.parse::<Ipv4Addr>() {
+        req.push(0x01);
+        req.extend_from_slice(&v4.octets());
+    } else {
+        let hb = probe_host.as_bytes();
+        if hb.is_empty() || hb.len() > 255 {
+            return None;
+        }
+        req.push(0x03);
+        req.push(hb.len() as u8);
+        req.extend_from_slice(hb);
+    }
+    req.extend_from_slice(&443u16.to_be_bytes());
+
+    let _ = stream.set_write_timeout(remaining_timeout(deadline));
+    let _ = stream.set_read_timeout(remaining_timeout(deadline));
+    stream.write_all(&req).ok()?;
+    let _ = socks5_read_bound_addr(&mut stream)?;
+
+    tls_probe_rtt(&mut stream, probe_host, seq, deadline)
+}
+
+/// Real end-to-end SOCKS5 UDP pass-through test using RFC 5389 STUN Binding Requests
+/// (immune to sing-box/Xray local DNS port 53 hijacking and QUIC port 443 blocking).
+fn ping_socks5_udp(entry: &TargetEntry, timeout_ms: u64, seq: u64) -> Option<u32> {
+    let (auth, host_port) = entry.split_proxy_auth();
+    let proxy_addr = parse_proxy_addr(host_port, 1080)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    // Keep `_ctrl` alive until the UDP exchange completes (RFC 1928 §7)
+    let mut _ctrl = socks5_handshake(proxy_addr, auth, deadline)?;
+    let _ = _ctrl.set_write_timeout(remaining_timeout(deadline));
+    let _ = _ctrl.set_read_timeout(remaining_timeout(deadline));
+    _ctrl
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .ok()?;
+
+    let (bnd_ip, bnd_port) = socks5_read_bound_addr(&mut _ctrl)?;
+    if bnd_port == 0 {
+        return None;
+    }
+    let relay_ip = if bnd_ip.is_unspecified() {
+        proxy_addr.ip()
+    } else {
+        bnd_ip
+    };
+    let relay_addr = SocketAddr::new(relay_ip, bnd_port);
+
+    let bind_addr = if relay_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let udp = UdpSocket::bind(bind_addr).ok()?;
+
+    // Build RFC 5389 STUN Binding Request with a unique 12-byte Transaction ID
+    let mut tx_id = [0u8; 12];
+    tx_id[0..8].copy_from_slice(&seq.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+    tx_id[8..12].copy_from_slice(&((seq ^ 0xA5A5_5A5A) as u32).to_le_bytes());
+
+    let mut stun_req = [0u8; 20];
+    stun_req[0] = 0x00;
+    stun_req[1] = 0x01; // Binding Request
+    stun_req[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // Magic Cookie
+    stun_req[8..20].copy_from_slice(&tx_id);
+
+    let pkt_cf = build_socks5_udp_domain("stun.cloudflare.com", 3478, &stun_req);
+    let pkt_gg = build_socks5_udp_domain("stun.l.google.com", 19302, &stun_req);
+
+    let start = Instant::now();
+    let _ = udp.send_to(&pkt_cf, relay_addr);
+    let _ = udp.send_to(&pkt_gg, relay_addr);
+
+    let mut buf = [0u8; 1500];
+    loop {
+        let rem = remaining_timeout(deadline)?;
+        let _ = udp.set_read_timeout(Some(rem));
+        let (n, _) = udp.recv_from(&mut buf).ok()?;
+        if n < 10 || buf[0] != 0x00 || buf[1] != 0x00 {
+            continue;
+        }
+        let hdr_len = match buf[3] {
+            0x01 => 10,
+            0x04 => 22,
+            0x03 => 7 + (buf[4] as usize),
+            _ => continue,
+        };
+        if n >= hdr_len + 20 {
+            let p = &buf[hdr_len..n];
+            if p[0] == 0x01
+                && p[1] == 0x01
+                && p[4..8] == [0x21, 0x12, 0xA4, 0x42]
+                && p[8..20] == tx_id
+            {
+                return Some(start.elapsed().as_millis() as u32);
+            }
+        }
+    }
+}
+
+fn ping_http_tcp(entry: &TargetEntry, probe_host: &str, timeout_ms: u64, seq: u64) -> Option<u32> {
+    let (auth, host_port) = entry.split_proxy_auth();
+    let proxy_addr = parse_proxy_addr(host_port, 8080)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    let mut stream = TcpStream::connect_timeout(&proxy_addr, remaining_timeout(deadline)?).ok()?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(remaining_timeout(deadline));
+    let _ = stream.set_read_timeout(remaining_timeout(deadline));
+
+    let mut req = format!("CONNECT {probe_host}:443 HTTP/1.1\r\nHost: {probe_host}:443\r\n");
+    if let Some((user, pass)) = auth {
+        let token = base64_encode(format!("{user}:{pass}").as_bytes());
+        req.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+
+    let mut resp = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while resp.len() < 4096 {
+        let _ = stream.set_read_timeout(remaining_timeout(deadline));
+        stream.read_exact(&mut byte).ok()?;
+        resp.push(byte[0]);
+        if resp.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let first_line = String::from_utf8_lossy(&resp);
+    let status_line = first_line.lines().next()?;
+    let status_code = status_line.split_whitespace().nth(1)?;
+    if status_code != "200" {
+        return None;
+    }
+
+    tls_probe_rtt(&mut stream, probe_host, seq, deadline)
+}
+
+fn encode_override(m: Option<PingMethod>) -> u8 {
+    match m {
+        None => 0,
+        Some(PingMethod::Icmp) => 1,
+        Some(PingMethod::Tcp) => 2,
+        Some(PingMethod::Udp) => 3,
+    }
+}
+
+fn decode_override(v: u8) -> Option<PingMethod> {
+    match v {
+        1 => Some(PingMethod::Icmp),
+        2 => Some(PingMethod::Tcp),
+        3 => Some(PingMethod::Udp),
+        _ => None,
+    }
+}
+
 pub struct PingEngine {
     running: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
-    reset_cycle: Arc<AtomicU64>,
     method: Arc<AtomicU8>,
+    target_cycles: Vec<Arc<AtomicU64>>,
+    target_overrides: Vec<Arc<AtomicU8>>,
 }
 
 impl PingEngine {
@@ -284,8 +643,9 @@ impl PingEngine {
         Self {
             running: Arc::new(AtomicBool::new(true)),
             generation: Arc::new(AtomicU64::new(0)),
-            reset_cycle: Arc::new(AtomicU64::new(0)),
             method: Arc::new(AtomicU8::new(initial_method as u8)),
+            target_cycles: Vec::new(),
+            target_overrides: Vec::new(),
         }
     }
 
@@ -293,12 +653,29 @@ impl PingEngine {
         self.method.store(method as u8, Ordering::Relaxed);
     }
 
-    pub fn bump_reset_cycle(&self) -> u64 {
-        self.reset_cycle.fetch_add(1, Ordering::SeqCst) + 1
+    pub fn set_target_method(&self, idx: usize, method: Option<PingMethod>) {
+        if let Some(ov) = self.target_overrides.get(idx) {
+            ov.store(encode_override(method), Ordering::Relaxed);
+        }
     }
 
-    pub fn current_cycle(&self) -> u64 {
-        self.reset_cycle.load(Ordering::SeqCst)
+    pub fn bump_target_cycle(&self, idx: usize) {
+        if let Some(c) = self.target_cycles.get(idx) {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn bump_all_cycles(&self) {
+        for c in &self.target_cycles {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn target_cycle(&self, idx: usize) -> u64 {
+        self.target_cycles
+            .get(idx)
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     pub fn stop(&self) {
@@ -307,22 +684,32 @@ impl PingEngine {
     }
 
     pub fn start_workers(
-        &self,
+        &mut self,
         hwnd: HWND,
-        targets: &[String],
+        targets: &[TargetEntry],
+        proxy_probe_host: &str,
         refresh_interval_ms: u64,
         timeout_ms: u64,
         tx: Sender<PingEvent>,
     ) {
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let hwnd_raw = hwnd as isize;
+        let probe_host_shared = proxy_probe_host.to_string();
+
+        self.target_cycles.clear();
+        self.target_overrides.clear();
 
         for (idx, target) in targets.iter().enumerate() {
-            let target = target.clone();
+            let my_cycle = Arc::new(AtomicU64::new(0));
+            let my_override = Arc::new(AtomicU8::new(encode_override(target.method)));
+            self.target_cycles.push(Arc::clone(&my_cycle));
+            self.target_overrides.push(Arc::clone(&my_override));
+
+            let mut target = target.clone();
+            let probe_host = probe_host_shared.clone();
             let tx = tx.clone();
             let running = Arc::clone(&self.running);
             let generation = Arc::clone(&self.generation);
-            let reset_cycle = Arc::clone(&self.reset_cycle);
             let method = Arc::clone(&self.method);
 
             thread::spawn(move || {
@@ -332,22 +719,31 @@ impl PingEngine {
 
                 while running.load(Ordering::Relaxed) && generation.load(Ordering::Relaxed) == gen {
                     let loop_start = Instant::now();
-                    let cycle = reset_cycle.load(Ordering::SeqCst);
-                    let active_method = PingMethod::from_u8(method.load(Ordering::Relaxed));
+                    let cycle = my_cycle.load(Ordering::SeqCst);
+                    target.method = decode_override(my_override.load(Ordering::Relaxed));
+                    let global_method = PingMethod::from_u8(method.load(Ordering::Relaxed));
+                    let active_method = target.effective_method(global_method);
 
-                    let latency = match resolve_ipv4(&target, &mut dns_cache) {
-                        Some(ip) => {
-                            let res = match active_method {
-                                PingMethod::Icmp => ping_icmp(ip, timeout_ms),
-                                PingMethod::Tcp => ping_tcp(ip, timeout_ms),
-                                PingMethod::Udp => ping_udp(ip, timeout_ms, seq),
-                            };
-                            if res.is_none() {
-                                dns_cache.remove(&target);
+                    let latency = match target.kind {
+                        TargetKind::Direct => match resolve_ipv4(&target.address, &mut dns_cache) {
+                            Some(ip) => {
+                                let res = match active_method {
+                                    PingMethod::Icmp => ping_icmp(ip, timeout_ms),
+                                    PingMethod::Tcp => ping_tcp(ip, timeout_ms),
+                                    PingMethod::Udp => ping_udp(ip, timeout_ms, seq),
+                                };
+                                if res.is_none() {
+                                    dns_cache.remove(&target.address);
+                                }
+                                res
                             }
-                            res
-                        }
-                        None => None,
+                            None => None,
+                        },
+                        TargetKind::Socks5 => match active_method {
+                            PingMethod::Udp => ping_socks5_udp(&target, timeout_ms, seq),
+                            _ => ping_socks5_tcp(&target, &probe_host, timeout_ms, seq),
+                        },
+                        TargetKind::Http => ping_http_tcp(&target, &probe_host, timeout_ms, seq),
                     };
                     seq = seq.wrapping_add(1);
 
@@ -355,7 +751,7 @@ impl PingEngine {
 
                     if running.load(Ordering::Relaxed)
                         && generation.load(Ordering::Relaxed) == gen
-                        && reset_cycle.load(Ordering::SeqCst) == cycle
+                        && my_cycle.load(Ordering::SeqCst) == cycle
                     {
                         if tx
                             .send(PingEvent {
@@ -377,6 +773,7 @@ impl PingEngine {
                         while remaining > 0
                             && running.load(Ordering::Relaxed)
                             && generation.load(Ordering::Relaxed) == gen
+                            && my_cycle.load(Ordering::SeqCst) == cycle
                         {
                             let step = remaining.min(100);
                             thread::sleep(Duration::from_millis(step));

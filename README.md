@@ -28,11 +28,15 @@ Engineered for minimal resource footprint (**~1.8 MB RAM**, **< 1 MB standalone 
 ## Features
 
 - **Ultra-Low Resource Usage:** Pure native Rust + Double-Buffered Win32 GDI (~1.8 MB RAM, near-zero idle CPU).
-- **100% Portable:** Single standalone `NanoPing.exe` that automatically manages a local `config.ini` beside itself.
+- **Portable & AppData Storage:** Automatically uses a local `config.ini` beside `NanoPing.exe` (Portable mode, e.g., `.zip` bundle) or `%APPDATA%\NanoPing\config.ini` (clean standalone `.exe`), switchable anytime inside Settings.
 - **3 Ping Methods:**
   - **ICMP:** Uses native Windows `IcmpSendEcho` API — **no Administrator privileges required**.
   - **TCP:** Measures TCP handshake latency on port `443`.
   - **UDP:** Multi-protocol probe (DNS `53`, RFC 9000 QUIC `443`, STUN `3478`, and Port Unreachable `33434`).
+- **SOCKS5 & HTTP Proxy Monitoring:** Test direct hosts and proxies side-by-side (`S5` / `HT`) with optional `user:pass@host:port` authentication:
+  - **SOCKS5 / HTTP TCP:** Real end-to-end TLS handshake RTT (immune to Xray/sing-box optimistic `1ms` replies).
+  - **SOCKS5 UDP (`UDP ASSOCIATE`):** Real RFC 5389 STUN pass-through test (immune to local DNS port 53 hijacking — ideal for verifying Discord Voice & gaming UDP).
+- **Per-Target Protocol Overrides:** Click any row's `I`/`T`/`U` badge to lock a custom protocol without resetting other targets; right-click to revert to `AUTO` (or right-click the global method button to reset all).
 - **Real-Time Statistics:** Sliding-window packet loss (`L:0%`), rolling average (`A:42ms`), and live taskbar title updates.
 - **Customizable Dark HUD:**
   - Borderless pure-black HUD with Windows 11 rounded corners, minimal `−` / `×` header controls, full-window drag, and ClearType rendering.
@@ -56,11 +60,11 @@ Get-FileHash NanoPing.exe -Algorithm SHA256
 
 ## Configuration (`config.ini`)
 
-`config.ini` is automatically created beside `NanoPing.exe` on first launch:
+`config.ini` is automatically stored in `%APPDATA%\NanoPing\config.ini` (or beside `NanoPing.exe` in Portable mode):
 
 | Key | Description | Default |
 | :--- | :--- | :--- |
-| `targets` | Comma-separated IP addresses or hostnames | `8.8.8.8, 4.2.2.4, google.com` |
+| `targets` | Comma-separated targets: `host[\|method]`, `s5://[user:pass@]host:port[\|method]`, or `http://[user:pass@]host:port` | `8.8.8.8, 4.2.2.4, google.com` |
 | `ping_method` | `icmp`, `tcp`, or `udp` | `icmp` |
 | `history_count` | Number of recent samples shown (`1`–`20`) | `3` |
 | `loss_window_size` | Sliding sample window for packet loss % | `20` |
@@ -75,6 +79,7 @@ Get-FileHash NanoPing.exe -Algorithm SHA256
 | `font_size` | Unified proportional UI font size (`9`–`28`) | `14` |
 | `opacity` | Main window opacity percentage (`25`–`100`) | `100` |
 | `check_updates` | Silently check for GitHub updates on startup | `True` |
+| `proxy_probe_host` | External destination used to measure real TCP latency through proxies | `1.1.1.1` |
 | `color_low` | Hex color for latency `< 100ms` | `#00cc55` |
 | `color_medium` | Hex color for latency `100–200ms` | `#e6e600` |
 | `color_high` | Hex color for latency `> 200ms` | `#e68a00` |
